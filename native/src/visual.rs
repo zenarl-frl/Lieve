@@ -72,6 +72,7 @@ impl App {
             self.text(dc,label,x+13,60,if i==self.tab { self.color } else { muted },true);
         }
         match self.tab {
+            5 => {self.todo_view(dc); return;}
             4 => {self.shelf_view(dc); return;}
             6 => { self.appearance(dc); return; }
             0 => {

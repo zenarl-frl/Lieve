@@ -1,5 +1,9 @@
 # Lieve native — Windows preview
 
+## Latest update: native To-do
+
+To-do is no longer a placeholder: Add task opens a native input dialog (up to 200 characters), click a row to toggle completion, `x` removes it, and scroll browses additional tasks. Up to 100 tasks are saved in `%APPDATA%\Lieve\tasks.txt`. Reminder scheduling and editing are not implemented. This update supersedes older To-do placeholder descriptions below. See the repository root README for the current feature matrix.
+
 Rust + Win32/GDI, without a browser runtime or GPU rendering loop. The React prototype remains in `../prototype` as the design reference.
 
 ## Build

@@ -8,6 +8,7 @@ mod water;
 mod animation;
 mod appearance;
 mod shelf;
+mod todo;
 use settings::Settings;
 use std::{cell::RefCell, ptr::{null, null_mut}};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -38,6 +39,8 @@ unsafe fn tray(hwnd: HWND, operation: u32) -> bool {
 }
 
 struct App {
+    tasks: Vec<todo::Task>,
+    task_offset: usize,
     shelf: Vec<std::path::PathBuf>,
     shelf_offset: usize,
     mascot: bool,
@@ -304,7 +307,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             let x = (lp as i16 as f32 / app.scale) as i32;
             let y = ((lp >> 16) as i16 as f32 / app.scale) as i32;
-            if app.expanded && app.tab==4 && y>=96 {
+            if app.expanded && app.tab==5 && y>=96 {
+                app.todo_click(hwnd,x,y);
+            } else if app.expanded && app.tab==4 && y>=96 {
                 app.shelf_click(hwnd,x,y);
             } else if app.expanded && app.tab==6 && y>=96 {
                 app.appearance_click(hwnd,x,y);
@@ -379,6 +384,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             DragFinish(drop);
             app.tab=4; app.expanded=true; app.shelf_offset=0;
             app.save_shelf(hwnd); app.resize(hwnd); 0
+        }
+        WM_MOUSEWHEEL if app.expanded && app.tab==5 => {
+            if ((wp>>16) as i16)<0 {app.task_offset=(app.task_offset+1).min(app.tasks.len().saturating_sub(4));}
+            else {app.task_offset=app.task_offset.saturating_sub(1);}
+            InvalidateRect(hwnd,null(),0); 0
         }
         WM_MOUSEWHEEL if app.expanded && app.tab==4 => {
             let delta=(wp>>16) as i16;
@@ -498,7 +508,7 @@ fn main() {
         let water_ml = water::load(&water_day);
         let mut motion: i32=1;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,(&mut motion as *mut i32).cast(),0);
-        let app = Box::new(RefCell::new(App { shelf:shelf::load(), shelf_offset:0, mascot:settings.mascot, compact_lyrics:settings.compact_lyrics, glow:settings.glow, dragging_glow:false, transition:None, motion_enabled:motion!=0, focus_left:1500, focus_end:None, water_ml, water_day, lyric_requests, lyric_results, lyric_key:String::new(), lyric_lines:Vec::new(), media:media::Snapshot::default(), media_commands, media_updates, tab:0, playing:false, position:66, ticks:0, title_font:font(22.,600), expanded:false, pinned:false, floating:settings.floating, minimal:settings.minimal, tracking:false, menu_open:false,
+        let app = Box::new(RefCell::new(App { tasks:todo::load(), task_offset:0, shelf:shelf::load(), shelf_offset:0, mascot:settings.mascot, compact_lyrics:settings.compact_lyrics, glow:settings.glow, dragging_glow:false, transition:None, motion_enabled:motion!=0, focus_left:1500, focus_end:None, water_ml, water_day, lyric_requests, lyric_results, lyric_key:String::new(), lyric_lines:Vec::new(), media:media::Snapshot::default(), media_commands, media_updates, tab:0, playing:false, position:66, ticks:0, title_font:font(22.,600), expanded:false, pinned:false, floating:settings.floating, minimal:settings.minimal, tracking:false, menu_open:false,
             color: settings.color,
             scale, font:font(16., 600), small_font:font(12., 400) }));
         let hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, class.as_ptr(), wide("Lieve").as_ptr(), WS_POPUP,

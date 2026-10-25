@@ -1,5 +1,13 @@
 # Native shell validation
 
+## Native To-do update
+
+- `cargo test`: **17 passed**, 2 optional live integration tests skipped. Added task-state parsing, invalid-input handling, count and length limits.
+- `cargo build --release`: passed; new executable launched.
+- Added native input dialog, completion toggles, deletion, wheel navigation and local task persistence. Dialog input/cancel, restart persistence, keyboard focus and full interaction still require manual acceptance testing; unit tests are not an end-to-end UI guarantee.
+- A synthetic pointer-message smoke test did not find the task dialog; this check is unresolved and must not be counted as a passed UI test.
+- The root README now describes build prerequisites, current features, privacy, data paths, known gaps and cross-device continuation.
+
 ## File shelf update
 
 - Unit tests: 14 passed, 2 live checks skipped. New tests reject relative/missing references, reject duplicate entries, and verify that removing a reference leaves the original file intact.
