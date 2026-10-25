@@ -77,6 +77,14 @@ cargo test
 cargo test -- --include-ignored --nocapture
 ```
 
+Uji interaksi To-do pada aplikasi yang sudah berjalan (Windows PowerShell):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke-todo.ps1
+```
+
+Jalankan dari `native/`, biarkan pointer di luar notch, dan jangan gunakan UI selama tes. Skrip menambah satu task uji unik, menguji penyimpanan/toggle/hapus/batal, lalu menghapus task uji dan melepas pin yang diaktifkannya. Jika gagal, periksa peringatan tentang task uji yang mungkin tertinggal; jangan hapus task pribadi.
+
 Working set build terdahulu teramati sekitar **29–30 MiB** setelah integrasi WinRT, bukan hanya shell. Angka ini bukan pengukuran peak atau jaminan pada semua device. Ukur versi release tanpa memaksa working-set trimming:
 
 ```powershell

@@ -1,5 +1,14 @@
 # Native shell validation
 
+## To-do interaction verification
+
+- Added repeatable Windows UI smoke test: `scripts/smoke-todo.ps1` (requires Lieve already running).
+- Corrected the test driver's DPI context and physical-coordinate conversion. The previous driver could send clicks to the wrong control.
+- For synthetic synchronous modal commands, the driver queues a wake-up message before checking owner persistence. Real queued user input and synchronously injected commands do not have identical message-loop timing.
+- Repeated runtime checks passed: Add dialog → enter unique task → save file; completion toggle → save completed flag; delete → remove persisted task; cancel → preserve task data.
+- All uniquely named fixtures created by failed and successful runs were removed through Lieve's UI. No original user task was intentionally changed. The test released the pin it acquired.
+- This closes the earlier unresolved dialog-open/add/cancel smoke-test finding. Physical keyboard navigation, screen readers, restart persistence, and multiple-monitor modal positioning still need manual acceptance testing.
+
 ## Native To-do update
 
 - `cargo test`: **17 passed**, 2 optional live integration tests skipped. Added task-state parsing, invalid-input handling, count and length limits.
