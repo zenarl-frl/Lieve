@@ -1,7 +1,8 @@
 use super::*;
-use windows_sys::Win32::UI::Controls::EM_SETLIMITTEXT;
+use windows_sys::Win32::UI::Controls::{EM_SETLIMITTEXT, EM_SETSEL};
 use std::{fs,path::PathBuf};
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Task { pub text:String, pub done:bool }
 fn path()->PathBuf { PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("Lieve").join("tasks.txt") }
 pub fn parse(text:&str)->Vec<Task> {
@@ -21,9 +22,15 @@ pub fn save(tasks:&[Task])->std::io::Result<()> {
 struct Input {edit:HWND, result:Option<String>}
 unsafe extern "system" fn input_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
     if msg==WM_NCCREATE {
-        SetWindowLongPtrW(hwnd,GWLP_USERDATA,(*(lp as *const CREATESTRUCTW)).lpCreateParams as isize); return 1;
+        SetWindowLongPtrW(hwnd,GWLP_USERDATA,(*(lp as *const CREATESTRUCTW)).lpCreateParams as isize);
+        return DefWindowProcW(hwnd,msg,wp,lp);
     }
     if msg==WM_CLOSE {DestroyWindow(hwnd); return 0;}
+    if msg==WM_DESTROY {
+        // Wake GetMessage even when a synchronous cross-thread command closes the
+        // dialog while the modal loop is waiting for a queued message.
+        PostMessageW(GetWindow(hwnd,GW_OWNER),WM_NULL,0,0); return 0;
+    }
     if msg==WM_COMMAND {
         let state=GetWindowLongPtrW(hwnd,GWLP_USERDATA) as *mut Input;
         if !state.is_null() {
@@ -43,14 +50,15 @@ unsafe extern "system" fn input_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRE
     DefWindowProcW(hwnd,msg,wp,lp)
 }
 
-unsafe fn input(owner:HWND)->Option<String> {
+unsafe fn input(owner:HWND,existing:Option<&str>)->Option<String> {
     let class=wide("LieveTaskInput"); let instance=GetModuleHandleW(null());
     let wc=WNDCLASSW {lpfnWndProc:Some(input_proc),hInstance:instance,lpszClassName:class.as_ptr(),hCursor:LoadCursorW(null_mut(),IDC_ARROW),hbrBackground:(COLOR_WINDOW+1) as HBRUSH,..std::mem::zeroed()};
     RegisterClassW(&wc);
     let mut state=Input{edit:null_mut(),result:None};
     let mut rect=std::mem::zeroed::<RECT>(); GetWindowRect(owner,&mut rect);
     let scale=GetDpiForWindow(owner) as f32/96.; let px=|n:i32|(n as f32*scale) as i32;
-    let hwnd=CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT,class.as_ptr(),wide("Lieve — Add task").as_ptr(),WS_CAPTION|WS_SYSMENU,
+    let title=if existing.is_some() {"Lieve — Edit task"}else{"Lieve — Add task"};
+    let hwnd=CreateWindowExW(WS_EX_DLGMODALFRAME|WS_EX_CONTROLPARENT,class.as_ptr(),wide(title).as_ptr(),WS_CAPTION|WS_SYSMENU,
         rect.left,rect.top+px(40),px(420),px(160),owner,null_mut(),instance,(&mut state as *mut Input).cast());
     if hwnd.is_null() {return None;}
     let child=|kind:&str,text:&str,style:u32,x,y,w,h,id| {
@@ -58,11 +66,12 @@ unsafe fn input(owner:HWND)->Option<String> {
         SendMessageW(control,WM_SETFONT,GetStockObject(DEFAULT_GUI_FONT) as usize,1); control
     };
     child("STATIC","What would you like to do?",0,16,12,380,22,0usize);
-    state.edit=child("EDIT","",WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL as u32,16,38,380,26,0usize);
+    state.edit=child("EDIT",existing.unwrap_or_default(),WS_BORDER|WS_TABSTOP|ES_AUTOHSCROLL as u32,16,38,380,26,0usize);
     SendMessageW(state.edit,EM_SETLIMITTEXT,200,0);
-    child("BUTTON","Add",WS_TABSTOP|BS_DEFPUSHBUTTON as u32,224,78,80,28,1usize);
+    child("BUTTON",if existing.is_some() {"Save"}else{"Add"},WS_TABSTOP|BS_DEFPUSHBUTTON as u32,224,78,80,28,1usize);
     child("BUTTON","Cancel",WS_TABSTOP,316,78,80,28,2usize);
     EnableWindow(owner,0); ShowWindow(hwnd,SW_SHOW); SetFocus(state.edit);
+    SendMessageW(state.edit,EM_SETSEL,0,-1);
     let mut msg=std::mem::zeroed::<MSG>();
     while IsWindow(hwnd)!=0 {
         let status=GetMessageW(&mut msg,null_mut(),0,0);
@@ -76,32 +85,49 @@ unsafe fn input(owner:HWND)->Option<String> {
 
 impl App {
     pub unsafe fn todo_click(&mut self,hwnd:HWND,x:i32,y:i32) {
-        if (255..286).contains(&y) && self.tasks.len()<100 {
+        let previous=self.tasks.clone();
+        let previous_offset=self.task_offset;
+        if layout::add_hit(x,y) && self.tasks.len()<100 {
             self.menu_open=true;
-            if let Some(text)=input(hwnd) {self.tasks.insert(0,Task{text,done:false}); self.task_offset=0;}
+            if let Some(text)=input(hwnd,None) {self.tasks.insert(0,Task{text,done:false}); self.task_offset=0;}
             self.menu_open=false;
-        } else if (100..244).contains(&y) {
-            let index=self.task_offset+((y-100)/36) as usize;
+        } else if let Some(row)=layout::list_row(x,y) {
+            let index=self.task_offset+row;
             if index<self.tasks.len() {
-                if x>=424 {self.tasks.remove(index); self.task_offset=self.task_offset.min(self.tasks.len().saturating_sub(4));}
+                if x>=layout::REMOVE_LEFT {self.tasks.remove(index); self.task_offset=self.task_offset.min(self.tasks.len().saturating_sub(4));}
+                else if x>=layout::EDIT_LEFT {
+                    self.menu_open=true;
+                    if let Some(text)=input(hwnd,Some(&self.tasks[index].text)) {self.tasks[index].text=text;}
+                    self.menu_open=false;
+                }
                 else {self.tasks[index].done=!self.tasks[index].done;}
             }
         }
-        if let Err(error)=save(&self.tasks) {MessageBoxW(hwnd,wide(&format!("Cannot save tasks: {error}")).as_ptr(),wide("Lieve").as_ptr(),MB_OK|MB_ICONWARNING);}
+        if self.tasks!=previous {
+            if let Err(error)=save(&self.tasks) {
+                self.tasks=previous; self.task_offset=previous_offset;
+                MessageBoxW(hwnd,wide(&format!("Cannot save tasks. Your change was not applied: {error}")).as_ptr(),wide("Lieve").as_ptr(),MB_OK|MB_ICONWARNING);
+            }
+        }
         InvalidateRect(hwnd,null(),0);
     }
     pub unsafe fn todo_view(&self,dc:HDC) {
         let muted=rgb(135,135,151);
-        if self.tasks.is_empty() {self.text(dc,"A quieter place for your tasks",28,145,rgb(235,235,243),false);}
+        if self.tasks.is_empty() {self.text(dc,"A quieter place for your tasks",24,132,rgb(235,235,243),false);}
         for (row,task) in self.tasks.iter().skip(self.task_offset).take(4).enumerate() {
-            let y=100+row as i32*36;
-            self.tile(dc,20,y,432,32,12,rgb(23,23,30));
-            self.tile(dc,30,y+9,14,14,6,if task.done {self.color}else{rgb(64,64,76)});
-            self.text(dc,&visual::shorten(&task.text,43),54,y+8,if task.done {muted}else{rgb(235,235,243)},true);
-            self.text(dc,"x",435,y+8,muted,true);
+            let y=layout::LIST_TOP+row as i32*layout::LIST_STEP;
+            self.tile(dc,layout::LIST_LEFT,y,layout::LIST_RIGHT-layout::LIST_LEFT,layout::LIST_ROW_H,12,rgb(23,23,30));
+            self.tile(dc,26,y+7,14,14,6,if task.done {self.color}else{rgb(64,64,76)});
+            SaveDC(dc);
+            IntersectClipRect(dc,self.px(48),self.px(y),self.px(layout::EDIT_LEFT-4),self.px(y+layout::LIST_ROW_H));
+            self.text(dc,&visual::shorten(&task.text,31),48,y+6,if task.done {muted}else{rgb(235,235,243)},true);
+            RestoreDC(dc,-1);
+            self.text(dc,"edit",322,y+6,muted,true);
+            self.text(dc,"x",370,y+6,muted,true);
         }
-        self.tile(dc,20,255,432,30,12,rgb(38,27,34)); self.text(dc,"+ Add task",195,262,self.color,true);
-        self.text(dc,&format!("{} / {} done · click to toggle · scroll for more",self.tasks.iter().filter(|t|t.done).count(),self.tasks.len()),24,298,muted,true);
+        self.tile(dc,layout::LIST_LEFT,layout::ADD_TOP,layout::LIST_RIGHT-layout::LIST_LEFT,layout::ADD_H,12,rgb(38,27,34));
+        self.fitted_text(dc,"+ Add task",layout::Rect{x:28,y:layout::ADD_TOP,w:240,h:layout::ADD_H},self.small_font,self.color,DT_LEFT);
+        self.fitted_text(dc,&format!("{} / {} done",self.tasks.iter().filter(|t|t.done).count(),self.tasks.len()),layout::Rect{x:272,y:layout::ADD_TOP,w:100,h:layout::ADD_H},self.small_font,muted,DT_RIGHT);
     }
 }
 

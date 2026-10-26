@@ -24,9 +24,28 @@ impl App {
     }
 
     pub unsafe fn cover(&self, dc: HDC, x: i32, y: i32, size: i32) {
-        let region = CreateRoundRectRgn(self.px(x), self.px(y), self.px(x+size), self.px(y+size), self.px(16), self.px(16));
+        self.cover_on(dc,x,y,size,rgb(8,8,11));
+    }
+    unsafe fn cover_on(&self,dc:HDC,x:i32,y:i32,size:i32,background:u32) {
+        if let Some(image)=self.media.artwork.as_ref().filter(|i|i.width>0 && i.height>0 && i.width<=256 && i.height<=256 && i.bgra.len()==i.width as usize*i.height as usize*4) {
+            self.cover_cache.borrow_mut().draw(dc,image,self.px(x),self.px(y),self.px(size) as usize,background,self.px(8) as f64);
+            return;
+        }
+        let mut origin=POINT{x:0,y:0};GetViewportOrgEx(dc,&mut origin);
+        let region = CreateRoundRectRgn(self.px(x)+origin.x, self.px(y)+origin.y, self.px(x+size)+origin.x, self.px(y+size)+origin.y, self.px(16), self.px(16));
         SaveDC(dc);
-        SelectClipRgn(dc, region);
+        ExtSelectClipRgn(dc,region,RGN_AND);
+        if self.media.available {
+            self.tile(dc,x,y,size,size,16,rgb(24,24,32));
+            let pen=CreatePen(PS_SOLID,self.px(1).max(1),rgb(132,132,151));let old=SelectObject(dc,pen);
+            let brush=SelectObject(dc,GetStockObject(NULL_BRUSH));
+            let (cx,cy)=(x+size/2,y+size/2-if size>=64 {8}else{0});
+            MoveToEx(dc,self.px(cx+4),self.px(cy-8),std::ptr::null_mut());LineTo(dc,self.px(cx+4),self.px(cy+4));
+            LineTo(dc,self.px(cx-3),self.px(cy+4));
+            Ellipse(dc,self.px(cx-7),self.px(cy+1),self.px(cx+4),self.px(cy+8));
+            SelectObject(dc,brush);SelectObject(dc,old);DeleteObject(pen);
+            if size>=64 {self.text(dc,if self.media.artwork_pending {"Loading..."}else{"No artwork"},x+(size-60)/2,y+size/2+12,rgb(132,132,151),true);}
+        } else {
         for row in 0..size {
             let t = row as f32 / size as f32;
             let color = rgb((255. - 121.*t) as u32, (184. - 129.*t) as u32, (130. + 75.*t) as u32);
@@ -39,114 +58,150 @@ impl App {
             Ellipse(dc,self.px(x+size-r),self.px(y+size-r),self.px(x+size+r),self.px(y+size+r));
         }
         SelectObject(dc,old_pen); SelectObject(dc,old_brush); DeleteObject(pen);
+        }
         RestoreDC(dc,-1); DeleteObject(region);
     }
 
     pub unsafe fn panel(&self, dc: HDC) {
-        let title = if self.media.available { self.media.title.as_str() } else { "Paper Sky" };
-        let artist = if self.media.available { self.media.artist.as_str() } else { "Lumen Coast" };
-        let album = if self.media.available { self.media.album.as_str() } else { "Summer Flows" };
-        let position = if self.media.available { self.media.position } else { self.position };
-        let duration = if self.media.available { self.media.duration.max(1) } else { 193 };
+        let muted=rgb(135,135,151);
+        self.framed_tile(dc,layout::Rect{x:16,y:10,w:280,h:28},14,rgb(17,17,24),rgb(32,32,44));
+        if layout::tab_slot(self.tab).is_some() {
+            let x=self.tab_pill.sample(std::time::Instant::now()).0.round() as i32;
+            self.tile(dc,x,12,layout::TAB_PILL_W,24,12,rgb(39,30,43));
+        }
+        for (i,(id,label)) in [(0,"Music"),(2,"Focus"),(3,"Water"),(4,"Shelf"),(5,"To-do")].iter().enumerate() {
+            let x=layout::TAB_START+i as i32*layout::TAB_STEP;
+            let active=self.tab==*id || (*id==0 && self.tab==1);
+            let color=if active {rgb(240,237,246)}else if self.hover==layout::Hover::Tab(i) {rgb(215,215,228)}else{muted};
+            self.fitted_text(dc,label,layout::Rect{x,y:12,w:layout::TAB_PILL_W,h:24},self.small_font,color,DT_CENTER);
+        }
+        let center_bg=if matches!(self.tab,7|9) {rgb(31,35,53)}else if self.hover==layout::Hover::Control {rgb(29,29,41)}else{rgb(17,17,24)};
+        self.framed_tile(dc,layout::Rect{x:layout::CONTROL_LEFT,y:10,w:32,h:28},12,center_bg,rgb(32,32,44));
+        self.icon(dc,layout::CONTROL_LEFT+7,15,18,icons::Glyph::Control,if matches!(self.tab,7|9) {rgb(126,178,255)}else{rgb(170,170,188)},center_bg,None);
+        let bg=if matches!(self.tab,6|8) {rgb(43,29,44)}else if self.hover==layout::Hover::Settings {rgb(29,29,41)}else{rgb(17,17,24)};
+        self.framed_tile(dc,layout::Rect{x:layout::SETTINGS_LEFT,y:10,w:32,h:28},12,bg,rgb(32,32,44));
+        self.icon(dc,layout::SETTINGS_LEFT+7,15,18,icons::Glyph::Settings,if matches!(self.tab,6|8) {self.color}else{rgb(170,170,188)},bg,None);
+        SaveDC(dc);SetViewportOrgEx(dc,0,-self.px(layout::BODY_OFFSET),std::ptr::null_mut());
+        self.panel_body(dc);RestoreDC(dc,-1);
+    }
+
+    pub(super) unsafe fn fitted_text(&self,dc:HDC,text:&str,rect:layout::Rect,font:HFONT,color:u32,align:u32) {
+        SelectObject(dc,font);SetTextColor(dc,color);
+        let mut rect=RECT{left:self.px(rect.x),top:self.px(rect.y),right:self.px(rect.x+rect.w),bottom:self.px(rect.y+rect.h)};
+        let text=wide(text);
+        DrawTextW(dc,text.as_ptr(),text.len() as i32-1,&mut rect,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX|align);
+    }
+    pub(super) unsafe fn framed_tile(&self,dc:HDC,rect:layout::Rect,radius:i32,fill:u32,border:u32) {
+        self.shapes.borrow_mut().draw(dc,self.px(rect.x),self.px(rect.y),self.px(rect.w) as usize,self.px(rect.h) as usize,self.px(radius),fill,border,rgb(8,8,11));
+    }
+    pub(super) unsafe fn smooth_tile(&self,dc:HDC,rect:layout::Rect,radius:i32,fill:u32,background:u32) {
+        self.shapes.borrow_mut().draw(dc,self.px(rect.x),self.px(rect.y),self.px(rect.w) as usize,self.px(rect.h) as usize,self.px(radius),fill,fill,background);
+    }
+    pub(super) unsafe fn icon(&self,dc:HDC,x:i32,y:i32,size:i32,glyph:icons::Glyph,color:u32,bg:u32,disc:Option<u32>) {
+        self.icons.borrow_mut().draw(dc,self.scale,x,y,size,glyph,color,bg,disc);
+    }
+
+    unsafe fn music(&self,dc:HDC) {
+        let title=if self.media.available {self.media.title.as_str()}else{"Paper Sky"};
+        let artist=if self.media.available {self.media.artist.as_str()}else{"Lumen Coast"};
+        let album=if self.media.available {self.media.album.as_str()}else{"Summer Flows"};
+        let duration=if self.media.available {self.media.duration.max(1)}else{193};
+        let position=if self.media.available {self.media.position}else{self.position}.min(duration);
+        let white=rgb(239,239,247);let muted=rgb(143,143,164);let bg=rgb(8,8,11);
+        self.framed_tile(dc,layout::MUSIC_CARD,20,rgb(18,18,25),rgb(35,35,47));
+        if self.tab==0 {
+            self.tile(dc,23,97,74,74,18,rgb(46,46,59));self.cover_on(dc,24,98,72,rgb(18,18,25));
+            let show_album=!album.trim().is_empty() && !album.trim().eq_ignore_ascii_case(title.trim());
+            let shift=if show_album {0}else{9};
+            self.fitted_text(dc,title,layout::Rect{x:112,y:102+shift,w:264,h:28},self.title_font,white,DT_LEFT);
+            self.fitted_text(dc,artist,layout::Rect{x:112,y:132+shift,w:264,h:18},self.small_font,rgb(173,173,193),DT_LEFT);
+            if show_album {self.fitted_text(dc,album,layout::Rect{x:112,y:152,w:264,h:14},self.caption_font,muted,DT_LEFT);}
+        } else {
+            self.fitted_text(dc,title,layout::Rect{x:32,y:96,w:336,h:14},self.caption_font,muted,DT_CENTER);
+            let (previous,current,next)=if self.media.available {
+                let active=self.lyric_lines.iter().rposition(|l|l.at<=self.media.position.saturating_mul(1000)).unwrap_or(0);
+                (active.checked_sub(1).and_then(|i|self.lyric_lines.get(i)).map(|l|l.text.as_str()),
+                    self.lyric_lines.get(active).map(|l|l.text.as_str()),self.lyric_lines.get(active+1).map(|l|l.text.as_str()))
+            } else {
+                let active=(self.position as usize/18).min(LINES.len()-1);
+                (active.checked_sub(1).and_then(|i|LINES.get(i)).copied(),LINES.get(active).copied(),LINES.get(active+1).copied())
+            };
+            if let Some(current)=current {
+                self.fitted_text(dc,previous.unwrap_or(""),layout::Rect{x:32,y:112,w:336,h:14},self.small_font,rgb(103,103,126),DT_CENTER);
+                self.fitted_text(dc,current,layout::Rect{x:32,y:128,w:336,h:22},self.font,self.color,DT_CENTER);
+                self.fitted_text(dc,next.unwrap_or(""),layout::Rect{x:32,y:152,w:336,h:14},self.small_font,rgb(103,103,126),DT_CENTER);
+            } else {
+                self.fitted_text(dc,"No synced lyrics",layout::Rect{x:32,y:120,w:336,h:24},self.font,white,DT_CENTER);
+                self.fitted_text(dc,"Lyrics aren't available for this track yet.",layout::Rect{x:32,y:151,w:336,h:16},self.small_font,muted,DT_CENTER);
+            }
+        }
+        self.tile(dc,24,190,352,3,3,rgb(39,39,51));
+        let progress=(352*position/duration) as i32;
+        if progress>0 {self.tile(dc,24,190,progress,3,3,self.color);}
+        self.fitted_text(dc,&format!("{}:{:02}",position/60,position%60),layout::Rect{x:24,y:197,w:64,h:16},self.caption_font,muted,DT_LEFT);
+        let left=duration.saturating_sub(position);
+        self.fitted_text(dc,&format!("-{}:{:02}",left/60,left%60),layout::Rect{x:312,y:197,w:64,h:16},self.caption_font,muted,DT_RIGHT);
+
+        self.tile(dc,24,220,48,28,10,rgb(14,14,20));
+        let status=if !self.media.available {"DEMO"}else if self.is_playing() {"PLAYING"}else{"PAUSED"};
+        self.fitted_text(dc,status,layout::Rect{x:26,y:220,w:44,h:28},self.caption_font,rgb(119,119,142),DT_CENTER);
+        for (rect,action,glyph) in [(layout::MUSIC_PREVIOUS,layout::MusicAction::Previous,icons::Glyph::Previous),
+            (layout::MUSIC_NEXT,layout::MusicAction::Next,icons::Glyph::Next)] {
+            let hovered=self.hover==layout::Hover::Music(action);let surface=if hovered {rgb(24,24,34)}else{bg};
+            if hovered {self.tile(dc,rect.x,rect.y,rect.w,rect.h,12,surface);}
+            self.icon(dc,rect.x+6,rect.y+6,20,glyph,if hovered {white}else{rgb(170,170,190)},surface,None);
+        }
+        let rect=layout::MUSIC_PLAY;
+        let disc=if self.hover==layout::Hover::Music(layout::MusicAction::Play) {rgb(255,255,255)}else{white};
+        self.icon(dc,rect.x,rect.y,36,if self.is_playing() {icons::Glyph::Pause}else{icons::Glyph::Play},rgb(16,16,23),bg,Some(disc));
+        let rect=layout::MUSIC_LYRICS;
+        let surface=if self.tab==1 {rgb(43,27,43)}else if self.hover==layout::Hover::Music(layout::MusicAction::Lyrics) {rgb(30,30,43)}else{rgb(20,20,29)};
+        self.framed_tile(dc,rect,12,surface,if self.tab==1 {self.color}else{rgb(34,34,47)});
+        self.icon(dc,rect.x+14,rect.y+4,20,icons::Glyph::Lyrics,if self.tab==1 {self.color}else{rgb(165,165,185)},surface,None);
+    }
+
+    unsafe fn panel_body(&self,dc:HDC) {
         let muted = rgb(135,135,151);
         let white = rgb(240,240,245);
-        self.cover(dc,14,14,26);
-        // Clip metadata to the left lane; its length must never move/overlap the eyes.
-        SaveDC(dc);
-        IntersectClipRect(dc,self.px(50),0,self.px(188),self.px(48));
-        self.text(dc,&shorten(if self.tab==6 {"Appearance"} else {title},20),50,12,white,true);
-        self.text(dc,&shorten(if self.tab==6 {"Make Lieve yours"} else {artist},20),50,29,muted,true);
-        RestoreDC(dc,-1);
-        self.eyes(dc,(470-68)/2,18);
-        let mut time=std::mem::zeroed::<SYSTEMTIME>();
-        GetLocalTime(&mut time);
-        self.text(dc,&format!("{:02}:{:02}",time.wHour,time.wMinute),322,21,muted,true);
-        self.tile(dc,385,14,28,28,10,if self.pinned { rgb(57,27,31) } else { rgb(24,24,30) });
-        self.text(dc,"P",394,18,if self.pinned { self.color } else { muted },true);
-        self.tile(dc,423,14,28,28,10,rgb(24,24,30));
-        self.text(dc,"...",430,17,muted,true);
-        self.tile(dc,12,50,446,35,20,rgb(25,25,31));
-        for (i,label) in ["Music","Lyrics","Focus","Water","Shelf","To-do"].iter().enumerate() {
-            let x = 16+i as i32*74;
-            if i == self.tab { self.tile(dc,x,54,70,27,15,rgb(57,28,33)); }
-            self.text(dc,label,x+13,60,if i==self.tab { self.color } else { muted },true);
-        }
         match self.tab {
+            7|9=>{self.control_view(dc);return;}
+            8=>{self.effects_view(dc);return;}
             5 => {self.todo_view(dc); return;}
             4 => {self.shelf_view(dc); return;}
             6 => { self.appearance(dc); return; }
-            0 => {
-                self.cover(dc,15,145,104);
-                self.text(dc,&shorten(album,36),138,126,muted,true);
-                SelectObject(dc,self.title_font); SetTextColor(dc,white);
-                let title=wide(&shorten(title,23)); TextOutW(dc,self.px(138),self.px(147),title.as_ptr(),title.len() as i32-1);
-                self.text(dc,&shorten(artist,38),138,176,muted,true);
-                self.tile(dc,138,207,315,3,3,rgb(44,44,51));
-                self.tile(dc,138,207,(315*position.min(duration)/duration) as i32,3,3,self.color);
-                self.text(dc,&format!("{}:{:02}",position/60,position%60),138,216,muted,true);
-                let left=duration.saturating_sub(position);
-                self.text(dc,&format!("-{}:{:02}",left/60,left%60),411,216,muted,true);
-                self.tile(dc,170,243,34,34,34,self.color);
-                self.text(dc,if self.is_playing() { "II" } else { ">" },181,250,rgb(9,9,12),true);
-                self.text(dc,"|<",141,250,white,true);
-                self.text(dc,">|",217,250,white,true);
-                self.text(dc,if self.media.available { "Windows media" } else { "Demo playback" },350,251,muted,true);
-            }
-            1 => {
-                if self.media.available {
-                    self.text(dc,"SYNCED LYRICS / LRCLIB",24,104,muted,true);
-                    if self.lyric_lines.is_empty() {
-                        self.text(dc,"No synced lyrics available",24,158,white,false);
-                        self.text(dc,"The compact notch shows the song title instead.",24,194,muted,true);
-                    } else {
-                        let active=self.lyric_lines.iter().rposition(|l| l.at<=self.media.position.saturating_mul(1000)).unwrap_or(0);
-                        let start=active.saturating_sub(2);
-                        for (row,i) in (start..(start+5).min(self.lyric_lines.len())).enumerate() {
-                            self.text(dc,&shorten(&self.lyric_lines[i].text,43),28,134+row as i32*28,if i==active {self.color} else {muted},false);
-                        }
-                    }
-                    return;
-                }
-                self.text(dc,"SYNCED LYRICS / DEMO",24,104,muted,true);
-                let active=(self.position as usize/18).min(LINES.len()-1);
-                let start=active.saturating_sub(2);
-                for (row,i) in (start..(start+5).min(LINES.len())).enumerate() {
-                    self.text(dc,LINES[i],28,134+row as i32*28,if i==active { self.color } else { muted },false);
-                }
-            }
+            0|1 => {self.music(dc);}
             2 => {
-                self.text(dc,"FOCUS TIME",28,112,muted,true);
-                self.text(dc,&format!("{:02}:{:02}",self.focus_left/60,self.focus_left%60),28,157,white,false);
-                self.text(dc,"Keeps running when the notch is closed",28,195,muted,true);
-                self.tile(dc,24,237,120,34,16,self.color);
-                self.text(dc,if self.focus_end.is_some() {"Pause"} else {"Start"},56,245,rgb(8,8,11),true);
-                self.tile(dc,158,237,95,34,16,rgb(30,30,38));
-                self.text(dc,"Reset",185,245,white,true);
+                self.text(dc,"FOCUS TIME",24,94,muted,true);
+                self.text(dc,&format!("{:02}:{:02}",self.focus_left/60,self.focus_left%60),24,128,white,false);
+                self.text(dc,"Keeps running when the notch is closed",24,160,muted,true);
+                self.smooth_tile(dc,layout::Rect{x:20,y:196,w:112,h:32},16,self.color,rgb(8,8,11));
+                self.fitted_text(dc,if self.focus_end.is_some() {"Pause"} else {"Start"},layout::Rect{x:20,y:196,w:112,h:32},self.small_font,rgb(8,8,11),DT_CENTER);
+                self.smooth_tile(dc,layout::Rect{x:144,y:196,w:88,h:32},16,rgb(30,30,38),rgb(8,8,11));
+                self.fitted_text(dc,"Reset",layout::Rect{x:144,y:196,w:88,h:32},self.small_font,white,DT_CENTER);
             }
             3 => {
-                self.text(dc,"TODAY / WATER INTAKE",28,112,muted,true);
-                self.text(dc,&format!("{:.1} / 1.5 L",self.water_ml as f32/1000.),28,153,white,false);
-                self.tile(dc,28,199,410,8,8,rgb(36,36,44));
-                let width=(410*self.water_ml.min(1500)/1500) as i32;
-                if width>0 { self.tile(dc,28,199,width,8,8,self.color); }
-                for (x,label) in [(24,"+200 ml"),(158,"+400 ml"),(292,"Reset")] {
-                    self.tile(dc,x,237,120,34,16,rgb(36,26,32));
-                    self.text(dc,label,x+28,245,self.color,true);
+                self.text(dc,"TODAY / WATER INTAKE",24,94,muted,true);
+                self.text(dc,&format!("{:.1} / 1.5 L",self.water_ml as f32/1000.),24,128,white,false);
+                self.tile(dc,24,164,352,7,7,rgb(36,36,44));
+                let width=(352*self.water_ml.min(1500)/1500) as i32;
+                if width>0 { self.tile(dc,24,164,width,7,7,self.color); }
+                for (x,label) in [(20,"+200 ml"),(144,"+400 ml"),(268,"Reset")] {
+                    self.smooth_tile(dc,layout::Rect{x,y:196,w:112,h:32},16,rgb(36,26,32),rgb(8,8,11));
+                    self.fitted_text(dc,label,layout::Rect{x,y:196,w:112,h:32},self.small_font,self.color,DT_CENTER);
                 }
-                self.text(dc,"Saved locally · resets each new day",28,278,muted,true);
+                self.text(dc,"Saved locally · resets each new day",24,240,muted,true);
             }
             _ => {
                 let (title,detail)=match self.tab {
                     2 => ("25:00", "Focus timer"), 3 => ("1.5 / 1.5 L", "Water reminder"),
                     4 => ("Drop files here", "File shelf"), _ => ("Your tasks, nearby", "To-do")
                 };
-                self.tile(dc,24,111,422,129,22,rgb(19,19,25));
-                self.text(dc,detail,43,130,muted,true);
-                self.text(dc,title,43,163,white,false);
-                self.text(dc,"Visual preview — native feature not connected yet",43,204,muted,true);
+                self.tile(dc,20,90,360,140,20,rgb(19,19,25));
+                self.text(dc,detail,32,108,muted,true);
+                self.text(dc,title,32,140,white,false);
+                self.text(dc,"Native feature not connected yet",32,182,muted,true);
             }
         }
-        self.text(dc,"LIEVE  /  NATIVE DESIGN PREVIEW",24,298,rgb(89,89,103),true);
     }
 }
 

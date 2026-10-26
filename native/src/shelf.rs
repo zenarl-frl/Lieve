@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use super::{App,wide};
+use super::{App,wide,layout};
 use windows_sys::Win32::{Foundation::*,UI::{WindowsAndMessaging::*,Controls::Dialogs::*,Shell::*},Graphics::Gdi::*};
 
 const LIMIT: usize = 100;
@@ -43,7 +43,7 @@ impl App {
     }
 
     pub unsafe fn shelf_click(&mut self, hwnd:HWND, x:i32, y:i32) {
-        if (255..286).contains(&y) {
+        if layout::add_hit(x,y) {
             self.menu_open=true;
             let mut buffer=vec![0u16;32768];
             let mut dialog=std::mem::zeroed::<OPENFILENAMEW>();
@@ -61,10 +61,10 @@ impl App {
                 self.shelf_offset=0; self.save_shelf(hwnd);
             }
             self.menu_open=false;
-        } else if (100..244).contains(&y) {
-            let index=self.shelf_offset+((y-100)/36) as usize;
+        } else if let Some(row)=layout::list_row(x,y) {
+            let index=self.shelf_offset+row;
             if index<self.shelf.len() {
-                if x>=424 {
+                if x>=layout::REMOVE_LEFT {
                     self.shelf.remove(index);
                     self.shelf_offset=self.shelf_offset.min(self.shelf.len().saturating_sub(4));
                     self.save_shelf(hwnd);
@@ -89,22 +89,24 @@ impl App {
     pub unsafe fn shelf_view(&self, dc:HDC) {
         let muted=super::rgb(135,135,151);
         if self.shelf.is_empty() {
-            self.text(dc,"Keep your files nearby",28,132,super::rgb(235,235,243),false);
-            self.text(dc,"Drop files onto the notch, or choose Add file.",28,169,muted,true);
-            self.text(dc,"Files stay in their original location.",28,193,muted,true);
+            self.text(dc,"Keep your files nearby",24,122,super::rgb(235,235,243),false);
+            self.text(dc,"Drop files here or use Add file.",24,155,muted,true);
+            self.text(dc,"Files stay in their original location.",24,177,muted,true);
         }
         for (row,file) in self.shelf.iter().skip(self.shelf_offset).take(4).enumerate() {
-            let y=100+row as i32*36;
-            self.tile(dc,20,y,432,32,12,super::rgb(23,23,30));
+            let y=layout::LIST_TOP+row as i32*layout::LIST_STEP;
+            self.tile(dc,layout::LIST_LEFT,y,layout::LIST_RIGHT-layout::LIST_LEFT,layout::LIST_ROW_H,12,super::rgb(23,23,30));
             let name=file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
-            self.text(dc,&super::visual::shorten(&name,48),30,y+2,super::rgb(235,235,243),true);
+            SaveDC(dc); IntersectClipRect(dc,self.px(26),self.px(y),self.px(layout::REMOVE_LEFT-4),self.px(y+layout::LIST_ROW_H));
+            self.text(dc,&super::visual::shorten(&name,40),26,y+1,super::rgb(235,235,243),true);
             // Do not stat paths during paint: removable/network drives may be slow.
-            self.text(dc,"Saved reference · click to open",30,y+17,muted,true);
-            self.text(dc,"x",435,y+8,muted,true);
+            self.text(dc,"Click to open · reference",26,y+14,muted,true);
+            RestoreDC(dc,-1);
+            self.text(dc,"x",370,y+6,muted,true);
         }
-        self.tile(dc,20,255,432,30,12,super::rgb(38,27,34));
-        self.text(dc,"+ Add file  /  drop files here",110,262,self.color,true);
-        self.text(dc,&format!("{} items · scroll for more · x removes reference only",self.shelf.len()),24,298,muted,true);
+        self.tile(dc,layout::LIST_LEFT,layout::ADD_TOP,layout::LIST_RIGHT-layout::LIST_LEFT,layout::ADD_H,12,super::rgb(38,27,34));
+        self.fitted_text(dc,"+ Add file",layout::Rect{x:28,y:layout::ADD_TOP,w:240,h:layout::ADD_H},self.small_font,self.color,DT_LEFT);
+        self.fitted_text(dc,&format!("{} {}",self.shelf.len(),if self.shelf.len()==1 {"item"}else{"items"}),layout::Rect{x:272,y:layout::ADD_TOP,w:100,h:layout::ADD_H},self.small_font,muted,DT_RIGHT);
     }
 }
 

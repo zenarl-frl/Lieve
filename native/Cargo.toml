@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-windows = { version = "0.58", features = ["Foundation", "Media_Control", "Foundation_Collections", "Web_Http", "Data_Json", "Win32_System_WinRT"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_Controls_Dialogs"] }
+windows = { version = "0.58", features = ["Foundation", "Media_Control", "Foundation_Collections", "Storage_Streams", "Graphics_Imaging", "Devices_Enumeration", "Devices_Bluetooth", "Devices_Radios", "Networking_Connectivity", "Web_Http", "Data_Json", "Win32_System_WinRT", "Win32_System_Com", "Win32_System_Wmi", "Win32_System_Rpc", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Power", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Shell", "Win32_UI_Controls_Dialogs"] }
 
 [profile.release]
 opt-level = "s"
