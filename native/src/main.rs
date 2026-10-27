@@ -21,8 +21,18 @@ mod system_control;
 mod system_ui;
 mod osd;
 mod glass;
+mod spectrum;
+mod desktop;
+mod autostart;
+mod general;
+mod spectrum_ui;
+mod keyboard;
+mod theme;
+mod ui;
+mod bluetooth;
+mod power_ui;
 use settings::Settings;
-use std::{cell::RefCell, ptr::{null, null_mut}};
+use std::{cell::{Cell,RefCell}, ptr::{null, null_mut}};
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows_sys::Win32::{
     Foundation::*,
@@ -36,7 +46,7 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_FRAME: u32 = WM_APP + 2;
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-fn rgb(r: u32, g: u32, b: u32) -> u32 { r | g << 8 | b << 16 }
+const fn rgb(r: u32, g: u32, b: u32) -> u32 { r | g << 8 | b << 16 }
 
 unsafe fn tray(hwnd: HWND, operation: u32) -> bool {
     let mut data = std::mem::zeroed::<NOTIFYICONDATAW>();
@@ -63,15 +73,29 @@ struct App {
     glass_upload:RefCell<render::Surface>,
     transparency:u32,
     frosted:bool,
+    fullscreen_auto_hide:bool,
+    hidden_fullscreen:bool,
+    desktop_check:std::time::Instant,
+    autostart_enabled:bool,
     system:system_control::Snapshot,
     system_controller:system_control::Controller,
     system_updates:std::sync::mpsc::Receiver<system_control::Update>,
     system_drag:Option<system_ui::Drag>,
     osd:osd::Hud,
+    spectrum:spectrum::Capture,
+    spectrum_visual:spectrum::Visual,
+    spectrum_preferences:settings::Spectrum,
+    navigation:keyboard::Navigation,
+    hotkey_registered:bool,
     control_return:usize,
+    bluetooth_return:usize,
+    bluetooth_offset:usize,
+    power_subscription:Option<power::Subscription>,
     icons: RefCell<icons::Renderer>,
     hover: layout::Hover,
     region_shape: Option<(i32,i32,i32)>,
+    dock_bounds:Option<(i32,i32)>,
+    pending_frame:Cell<Option<animation::Frame>>,
     power: power::Monitor,
     tasks: Vec<todo::Task>,
     task_offset: usize,
@@ -109,6 +133,7 @@ struct App {
     position: u32,
     ticks: u32,
     title_font: HFONT,
+    metric_font:HFONT,
     caption_font: HFONT,
     expanded: bool,
     pinned: bool,
@@ -124,18 +149,22 @@ struct App {
 
 impl App {
     fn save(&self) {
-        if let Err(error) = (Settings { motion:self.motion_mode, mascot:self.mascot, devil_grin:self.devil_grin,transparency:self.transparency,frosted:self.frosted, compact_lyrics:self.compact_lyrics,glow:self.glow, color: self.color, floating: self.floating, minimal: self.minimal }).save() {
+        if let Err(error) = (Settings { motion:self.motion_mode, mascot:self.mascot, devil_grin:self.devil_grin,transparency:self.transparency,frosted:self.frosted,fullscreen_auto_hide:self.fullscreen_auto_hide,spectrum:self.spectrum_preferences, compact_lyrics:self.compact_lyrics,glow:self.glow, color: self.color, floating: self.floating, minimal: self.minimal }).save() {
             // Persistence failure is nonfatal; the current session keeps working.
             unsafe { OutputDebugStringW(wide(&format!("Lieve: cannot save settings: {error}")).as_ptr()); }
         }
     }
     fn px(&self, n: i32) -> i32 { (n as f32 * self.scale).round() as i32 }
+    unsafe fn panel_left(&self,hwnd:HWND,client_width:i32)->i32 {
+        let mut bounds=std::mem::zeroed::<RECT>();GetWindowRect(hwnd,&mut bounds);
+        layout::content_left(bounds.left,client_width,self.px(layout::PANEL_W),self.dock_bounds)
+    }
     fn open_settings(&mut self) {
-        if !matches!(self.tab,6|8) {self.settings_return=self.tab;}
+        if !matches!(self.tab,6|8|10|11|12) {self.settings_return=self.tab;}
         self.tab=6;
     }
     fn toggle_settings(&mut self) {
-        if matches!(self.tab,6|8) {self.tab=self.settings_return;}else{self.open_settings();}
+        if matches!(self.tab,6|8|10|11|12) {self.tab=self.settings_return;}else{self.open_settings();}
     }
     unsafe fn request_restart(&mut self,hwnd:HWND) {self.save();self.restart_requested=true;PostMessageW(hwnd,WM_CLOSE,0,0);}
     unsafe fn set_grin(&mut self,hwnd:HWND,enabled:bool) {
@@ -187,13 +216,19 @@ impl App {
     }
 
     unsafe fn resize(&mut self, hwnd: HWND) {
+        if !self.expanded {self.navigation.release(hwnd);self.hover=layout::Hover::None;}
         let now=std::time::Instant::now();
         let motion=self.motion_enabled && IsWindowVisible(hwnd)!=0;
         // Keep the layered glass mode for the whole shell motion. Switching it
         // mid-flight visibly flashed, so drop it only at a fully settled idle.
         let glass_visible=self.expanded || self.osd.visible(now) || (self.is_playing() && self.compact_lyrics)
             || self.transition.is_some() || !self.content.sample(now).1 || !self.tab_pill.sample(now).1;
-        if self.glass.configure(hwnd,glass_visible,self.frosted && self.transparency>0) {self.region_shape=None;}
+        if self.glass.configure(hwnd,glass_visible,self.frosted && self.transparency>0) {
+            self.region_shape=None;
+            // Per-pixel alpha already clips the layered shell. Replacing a
+            // second, rectangular Win32 region every frame adds composition churn.
+            if self.glass.active {SetWindowRgn(hwnd,null_mut(),0);}
+        }
         self.refresh_gaze(hwnd,now);
         let stage=if self.expanded {animation::Stage::Panel}
             else if self.osd.visible(now) {animation::Stage::Osd}
@@ -208,10 +243,11 @@ impl App {
         let mut monitor = std::mem::zeroed::<MONITORINFO>();
         monitor.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mut monitor);
+        self.dock_bounds=if self.floating {None}else{Some((monitor.rcMonitor.left,monitor.rcMonitor.right))};
         let mut old = std::mem::zeroed::<RECT>();
         GetWindowRect(hwnd, &mut old);
         let x = if self.floating { old.left.max(monitor.rcWork.left).min((monitor.rcWork.right - w).max(monitor.rcWork.left)) }
-            else { monitor.rcMonitor.left + (monitor.rcMonitor.right - monitor.rcMonitor.left - w) / 2 };
+            else {layout::centered_left(monitor.rcMonitor.left,monitor.rcMonitor.right,w)};
         let y = if self.floating { old.top.max(monitor.rcWork.top + self.px(16)).min((monitor.rcWork.bottom - h).max(monitor.rcWork.top)) }
             else { monitor.rcMonitor.top };
         let radius=self.px(if self.floating {26}else if self.expanded {22}else if self.minimal {6}else{20});
@@ -219,13 +255,13 @@ impl App {
         let from = animation::Frame { x:old.left,y:old.top,w:old.right-old.left,h:old.bottom-old.top,radius:self.radius };
         if !motion {
             self.transition=None; self.apply_frame(hwnd,target);
-        } else if !self.transition.as_ref().map(|t| t.to==target).unwrap_or(false) && from!=target {
-            let velocity=self.transition.as_ref().map(|t|t.sample(now).1).unwrap_or([0.;5]);
-            self.transition=Some(animation::Transition {from,to:target,velocity,started:now});
-        } else if self.region_shape.is_none() {self.apply_frame(hwnd,from);
+        } else {
+            animation::Transition::retarget(&mut self.transition,from,target,now);
+            if self.transition.is_none() {self.apply_frame(hwnd,target);}
+            else if self.region_shape.is_none() {self.apply_frame(hwnd,from);}
         }
-        if self.transition.is_some() || !self.content.sample(now).1 || !self.tab_pill.sample(now).1
-            || (motion && (!self.blink.sample(now).1 || !self.gaze.sample(now).1 || (self.devil_grin && !self.grin.sample(now).1) || self.osd.moving(now))) {
+        if !self.hidden_fullscreen && (self.transition.is_some() || !self.content.sample(now).1 || !self.tab_pill.sample(now).1 || self.spectrum_visual.moving()
+            || (motion && (!self.blink.sample(now).1 || !self.gaze.sample(now).1 || (self.devil_grin && !self.grin.sample(now).1) || self.osd.moving(now)))) {
             self.clock.start(hwnd);
         } else {self.clock.stop(hwnd);}
         InvalidateRect(hwnd,null(),0);
@@ -233,15 +269,23 @@ impl App {
 
     unsafe fn apply_frame(&mut self, hwnd: HWND, frame: animation::Frame) {
         let animation::Frame { x,y,w,h,radius } = frame;
+        // Quantize size once, then derive position from the same physical anchor.
+        let x=if let Some((left,right))=self.dock_bounds {layout::centered_left(left,right,w)}else{x};
         self.radius=radius;
+        let glass=self.glass.active && !self.glass.failed.get();
+        if glass && IsWindowVisible(hwnd)!=0 && !self.hidden_fullscreen {
+            // Publish geometry with the new pixels in one ULW transaction, not
+            // SetWindowPos(old bitmap) followed later by a separate pixel update.
+            self.pending_frame.set(Some(animation::Frame{x,y,w,h,radius}));InvalidateRect(hwnd,null(),0);return;
+        }
+        self.pending_frame.set(None);
         let mut previous=std::mem::zeroed::<RECT>(); GetWindowRect(hwnd,&mut previous);
         if previous.left!=x || previous.top!=y || previous.right-previous.left!=w || previous.bottom-previous.top!=h {
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         }
-        if self.region_shape!=Some((w,h,radius)) {
-            let glass=self.glass.active && !self.glass.failed.get();
-            let region = if glass {CreateRectRgn(0,0,w,h)}else{CreateRoundRectRgn(0, 0, w + 1, h + 1, radius*2, radius*2)};
-            if !self.floating && !glass {
+        if !glass && self.region_shape!=Some((w,h,radius)) {
+            let region=CreateRoundRectRgn(0,0,w+1,h+1,radius*2,radius*2);
+            if !self.floating {
                 let top = CreateRectRgn(0, 0, w, radius.min(h/2));
                 CombineRgn(region, region, top, RGN_OR); DeleteObject(top);
             }
@@ -312,7 +356,12 @@ impl App {
         let mut ps = std::mem::zeroed::<PAINTSTRUCT>();
         let target = print.unwrap_or_else(||BeginPaint(hwnd, &mut ps));
         let mut client=std::mem::zeroed::<RECT>(); GetClientRect(hwnd,&mut client);
+        let pending=if print.is_none() {self.pending_frame.get()}else{None};
+        if let Some(frame)=pending {client.right=frame.w;client.bottom=frame.h;}
         let cw=client.right.max(1); let ch=client.bottom.max(1);
+        let mut window=std::mem::zeroed::<RECT>();GetWindowRect(hwnd,&mut window);
+        if let Some(frame)=pending {window.left=frame.x;window.top=frame.y;}
+        let layer_left=|width|layout::content_left(window.left,cw,width,self.dock_bounds);
         let mut surfaces=self.surfaces.borrow_mut();
         if !surfaces.output.ensure(target,cw,ch) {if print.is_none() {EndPaint(hwnd,&ps);}return;}
         let dc=surfaces.output.dc;
@@ -328,13 +377,13 @@ impl App {
             let rect=RECT{left:0,top:0,right:pw,bottom:ph};
             FillRect(layer,&rect,background); SetBkMode(layer,TRANSPARENT as i32);
             if stage==2 {self.panel(layer);
-                if !matches!(self.tab,7|8|9) && self.osd.opacity(std::time::Instant::now())>0. {self.draw_osd(layer,70,54,260,42,self.osd.opacity(std::time::Instant::now()));}
+                if self.osd_overlay() {self.draw_osd(layer,70,54,260,42,self.osd.opacity(std::time::Instant::now()));}
             }
             else if stage==3 {self.draw_osd(layer,0,0,300,56,1.);}
             else if stage==1 {
                 self.cover(layer,10,7,24);
-                self.text(layer,&self.compact_line(),45,10,rgb(235,235,242),true);
-                self.text(layer,"II",303,9,self.color,true);
+                self.fitted_text(layer,&self.compact_line(),layout::Rect{x:45,y:6,w:if self.spectrum_preferences.enabled {244}else{272},h:26},self.small_font,rgb(235,235,242),DT_LEFT);
+                if self.spectrum_preferences.enabled {self.draw_spectrum(layer,layout::Rect{x:298,y:9,w:24,h:20},rgb(8,8,11));}
             } else if !self.minimal {
                 if self.mascot {let visible_h=(ch as f32/self.scale).min(h as f32) as i32;self.eyes(layer,(w-68)/2,(visible_h-20)/2);}
                 else {
@@ -344,39 +393,51 @@ impl App {
             }
             // Keep text/eyes at native scale. The growing shell clips centred
             // layers instead of stretching their bitmap to each intermediate size.
-            let y=if stage==0 {-self.px((4.*(1.-alpha)).round() as i32)}else{0};
-            if alpha>=0.999 {BitBlt(dc,(cw-pw)/2,y,pw,ph,layer,0,0,SRCCOPY);}
-            else {AlphaBlend(dc,(cw-pw)/2,y,pw,ph,layer,0,0,pw,ph,
+            let y=if stage==0 {-(4.*self.scale as f64*(1.-alpha)).round() as i32}else{0};
+            if alpha>=0.999 {BitBlt(dc,layer_left(pw),y,pw,ph,layer,0,0,SRCCOPY);}
+            else {AlphaBlend(dc,layer_left(pw),y,pw,ph,layer,0,0,pw,ph,
                 BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8,BlendFlags:0,SourceConstantAlpha:(alpha*255.).round() as u8,AlphaFormat:0});}
             SelectObject(layer,GetStockObject(SYSTEM_FONT));
         }
         DeleteObject(background);
+        let mut presented=false;let mut retry=false;
         if self.glass.active && !self.glass.failed.get() && print.is_none() {
-            let offset=(cw-self.px(layout::PANEL_W))/2;
+            let offset=layer_left(self.px(layout::PANEL_W));
             let rect=|x:i32,y:i32,w:i32,h:i32|RECT{left:offset+self.px(x),top:self.px(y),right:offset+self.px(x+w),bottom:self.px(y+h)};
             let mut opaque=Vec::new();
             let strength=weights[2];
             if strength>0.001 {
                 if self.tab==0 {opaque.push(glass::Opaque{rect:rect(16,50,368,88),radius:self.px(10),strength});}
                 if matches!(self.tab,0|1) {opaque.push(glass::Opaque{rect:rect(layout::MUSIC_PLAY.x+8,layout::MUSIC_PLAY.y-layout::BODY_OFFSET+8,20,20),radius:0,strength});}
-                if self.tab==2 {opaque.push(glass::Opaque{rect:rect(28,164,96,16),radius:0,strength});}
-                if self.tab==6 {opaque.push(glass::Opaque{rect:rect(22,78,152,38),radius:self.px(6),strength});}
+                if matches!(self.tab,2|3) {opaque.push(glass::Opaque{rect:rect(28,164,96,16),radius:0,strength});}
+                if self.tab==6 {opaque.push(glass::Opaque{rect:rect(24,78,152,38),radius:self.px(6),strength});}
             }
-            if !glass::present(hwnd,&surfaces.output,&mut self.glass_raster.borrow_mut(),&mut self.glass_upload.borrow_mut(),cw,ch,self.transparency,self.radius,self.floating,&opaque) {
+            if !glass::present(hwnd,&surfaces.output,&mut self.glass_raster.borrow_mut(),&mut self.glass_upload.borrow_mut(),cw,ch,self.transparency,self.radius,self.floating,&opaque,pending.map(|f|(f.x,f.y))) {
                 self.glass.failed.set(true);let style=GetWindowLongPtrW(hwnd,GWL_EXSTYLE) as u32;
                 SetWindowLongPtrW(hwnd,GWL_EXSTYLE,(style&!WS_EX_LAYERED) as isize);
+                self.pending_frame.set(None);
+                if let Some(frame)=pending {SetWindowPos(hwnd,HWND_TOPMOST,frame.x,frame.y,frame.w,frame.h,SWP_NOACTIVATE);}
+                let region=CreateRoundRectRgn(0,0,cw+1,ch+1,self.radius*2,self.radius*2);
+                if !self.floating {let top=CreateRectRgn(0,0,cw,self.radius.min(ch/2));CombineRgn(region,region,top,RGN_OR);DeleteObject(top);}
+                if SetWindowRgn(hwnd,region,0)==0 {DeleteObject(region);}retry=true;
                 BitBlt(target,0,0,cw,ch,dc,0,0,SRCCOPY);
-            }
+            }else{self.pending_frame.set(None);presented=true;}
         }else{BitBlt(target,0,0,cw,ch,dc,0,0,SRCCOPY);}
-        if print.is_none() {EndPaint(hwnd, &ps);}
+        if print.is_none() {EndPaint(hwnd, &ps);if presented {ValidateRect(hwnd,null());}else if retry {InvalidateRect(hwnd,null(),0);}}
     }
 
     unsafe fn menu(&mut self, hwnd: HWND) {
         let menu = CreatePopupMenu();
-        AppendMenuW(menu,MF_STRING|MF_GRAYED,0,wide(&format!("Power: {}",self.power.snapshot.label())).as_ptr());
+        AppendMenuW(menu,MF_STRING,26,wide(&format!("Power: {}...",self.power.snapshot.label())).as_ptr());
         AppendMenuW(menu,MF_SEPARATOR,0,null());
         AppendMenuW(menu, MF_STRING, 14, wide("Appearance...").as_ptr());
         AppendMenuW(menu, MF_STRING, 16, wide("Control Center").as_ptr());
+        AppendMenuW(menu, MF_STRING, 23, wide("System settings...").as_ptr());
+        AppendMenuW(menu, MF_STRING, 24, wide("Spectrum settings...").as_ptr());
+        AppendMenuW(menu, MF_STRING, 25, wide("Bluetooth devices...").as_ptr());
+        for (id,label,on) in [(40,"Hide in fullscreen",self.fullscreen_auto_hide),(41,"Start with Windows",self.autostart_enabled)] {
+            AppendMenuW(menu,MF_STRING|if on {MF_CHECKED}else{0},id,wide(label).as_ptr());
+        }
         AppendMenuW(menu,MF_STRING|if self.devil_grin {MF_CHECKED}else{0},22,wide("Devil grin").as_ptr());
         AppendMenuW(menu, MF_STRING, 15, wide("Clear shelf references").as_ptr());
         AppendMenuW(menu,MF_SEPARATOR,0,null());
@@ -418,6 +479,12 @@ impl App {
             20 => { PostMessageW(hwnd, WM_CLOSE, 0, 0); return; }
             21 => {self.request_restart(hwnd);return;}
             22 => {self.set_grin(hwnd,!self.devil_grin);return;}
+            23 => {self.open_settings();self.tab=10;self.expanded=true;self.pinned=true;}
+            24 => {self.open_settings();self.tab=11;self.expanded=true;self.pinned=true;}
+            25 => {if self.tab!=9 {self.bluetooth_return=self.tab;}self.tab=9;self.expanded=true;self.pinned=true;self.system_controller.refresh_bluetooth();}
+            26 => {self.open_settings();self.tab=12;self.expanded=true;self.pinned=true;}
+            40 => {self.toggle_fullscreen_hide(hwnd);return;}
+            41 => {self.toggle_autostart(hwnd);return;}
             _ => {}
         }
         self.save();
@@ -450,27 +517,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return 1;
     }
     if ptr.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
-    if msg == WM_DESTROY { tray(hwnd, NIM_DELETE); for id in [1,2,3,4,5,6,7,8] { KillTimer(hwnd, id); } PostQuitMessage(0); return 0; }
+    if msg == WM_DESTROY { UnregisterHotKey(hwnd,keyboard::HOTKEY_ID);tray(hwnd, NIM_DELETE); for id in [1,2,3,4,5,6,7,8,9] { KillTimer(hwnd, id); } PostQuitMessage(0); return 0; }
     // Win32 calls can synchronously re-enter this procedure during resize/menu/drag.
     let Ok(mut app) = (&*ptr).try_borrow_mut() else {
         return DefWindowProcW(hwnd, msg, wp, lp);
     };
     match msg {
+        WM_HOTKEY if wp==keyboard::HOTKEY_ID as usize && app.hotkey_registered=>{app.toggle_keyboard_panel(hwnd);0}
+        WM_KEYDOWN=>{if app.keyboard_key(hwnd,wp as u16,(lp as usize&(1<<30))!=0) {0}else{DefWindowProcW(hwnd,msg,wp,lp)}}
+        WM_KILLFOCUS=>{app.navigation.blur();InvalidateRect(hwnd,null(),0);DefWindowProcW(hwnd,msg,wp,lp)}
         WM_COMMAND if wp&0xffff==16 => {app.control_return=app.tab;app.tab=7;app.expanded=true;app.pinned=true;app.system_controller.refresh();app.resize(hwnd);0}
         WM_COMMAND if wp&0xffff==21 => {app.request_restart(hwnd);0}
         WM_COMMAND if wp&0xffff==22 => {let enabled=!app.devil_grin;app.set_grin(hwnd,enabled);0}
+        WM_COMMAND if wp&0xffff==23 => {app.open_settings();app.tab=10;app.expanded=true;app.pinned=true;app.resize(hwnd);0}
+        WM_COMMAND if wp&0xffff==24 => {app.open_settings();app.tab=11;app.expanded=true;app.pinned=true;app.resize(hwnd);0}
+        WM_COMMAND if wp&0xffff==25 => {if app.tab!=9 {app.bluetooth_return=app.tab;}app.tab=9;app.expanded=true;app.pinned=true;app.system_controller.refresh_bluetooth();app.resize(hwnd);0}
+        WM_COMMAND if wp&0xffff==26 => {app.open_settings();app.tab=12;app.expanded=true;app.pinned=true;app.resize(hwnd);0}
+        WM_COMMAND if wp&0xffff==40 => {app.toggle_fullscreen_hide(hwnd);0}
+        WM_COMMAND if wp&0xffff==41 => {app.toggle_autostart(hwnd);0}
         WM_COMMAND if (30..=32).contains(&(wp as u32 & 0xffff)) => {
             app.set_motion(hwnd,wp as u32 & 0xffff); 0
         }
         WM_SETTINGCHANGE => {app.refresh_motion(); app.resize(hwnd); 0}
+        WM_POWERBROADCAST=>{if matches!(wp as u32,PBT_APMPOWERSTATUSCHANGE|PBT_POWERSETTINGCHANGE|PBT_APMRESUMEAUTOMATIC) {app.refresh_power(hwnd);}1}
         WM_PAINT => { app.paint(hwnd); 0 }
         WM_PRINT|WM_PRINTCLIENT => {app.paint_target(hwnd,Some(wp as HDC));0}
         WM_ERASEBKGND => 1,
         WM_MOUSEACTIVATE => MA_NOACTIVATE as isize,
+        WM_SETCURSOR if lp as u32&0xffff==HTCLIENT=>{SetCursor(LoadCursorW(null_mut(),if app.hover==layout::Hover::None {IDC_ARROW}else{IDC_HAND}));1}
         WM_MOUSEMOVE => {
+            if app.hidden_fullscreen {return 0;}
+            if !app.navigation.allow_hover() {return 0;}
+            if app.navigation.visible {app.navigation.visible=false;InvalidateRect(hwnd,null(),0);}
             if let Some(kind)=app.system_drag {
                 let mut client=std::mem::zeroed::<RECT>();GetClientRect(hwnd,&mut client);
-                let x=(lp as i16 as f32/app.scale) as i32-(((client.right-app.px(layout::PANEL_W))/2) as f32/app.scale).round() as i32;
+                let x=((lp as i16 as i32-app.panel_left(hwnd,client.right)) as f32/app.scale) as i32;
                 app.system_slider(hwnd,kind,x);return 0;
             }
             if app.dragging_glow {
@@ -486,21 +567,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 TrackMouseEvent(&mut track);
                 if !app.expanded { app.expanded = true; app.resize(hwnd); }
             }
-            let mut x=(lp as i16 as f32/app.scale) as i32;
             let y=((lp>>16) as i16 as f32/app.scale) as i32;
             let mut client=std::mem::zeroed::<RECT>();GetClientRect(hwnd,&mut client);
-            x-=(((client.right-app.px(layout::PANEL_W))/2) as f32/app.scale).round() as i32;
-            let hover=if app.expanded {layout::hover(app.tab,x,y)}else{layout::Hover::None};
+            let x=((lp as i16 as i32-app.panel_left(hwnd,client.right)) as f32/app.scale) as i32;
+            let mut hover=if app.expanded {layout::hover(app.tab,x,y)}else{layout::Hover::None};
+            match hover {
+                layout::Hover::ListRow(row)|layout::Hover::ListEdit(row)|layout::Hover::ListRemove(row)=>{
+                    if (app.tab==5 && app.task_offset+row>=app.tasks.len()) || (app.tab==4 && app.shelf_offset+row>=app.shelf.len()) {hover=layout::Hover::None;}
+                },
+                layout::Hover::Action(layout::Action::TodoAdd) if app.tasks.len()>=100=>hover=layout::Hover::None,
+                layout::Hover::Action(layout::Action::ShelfAdd) if app.shelf.len()>=100=>hover=layout::Hover::None,
+                layout::Hover::Action(layout::Action::Volume) if app.system.audio.volume.is_none()=>hover=layout::Hover::None,
+                _=>{},
+            }
             if hover!=app.hover {app.hover=hover;InvalidateRect(hwnd,null(),0);}
+            SetCursor(LoadCursorW(null_mut(),if hover==layout::Hover::None {IDC_ARROW}else{IDC_HAND}));
             0
         }
         WM_MOUSELEAVE => {
+            app.navigation.allow_hover();
             if app.hover!=layout::Hover::None {app.hover=layout::Hover::None;InvalidateRect(hwnd,null(),0);}
             app.tracking = false;
             if !app.pinned && !app.menu_open && app.system_drag.is_none() { SetTimer(hwnd,3,180,None); }
             0
         }
         WM_LBUTTONDOWN => {
+            if app.hidden_fullscreen {return 0;}
+            app.navigation.visible=false;
             let mut x = (lp as i16 as f32 / app.scale) as i32;
             let mut y = ((lp >> 16) as i16 as f32 / app.scale) as i32;
             if app.expanded {
@@ -508,12 +601,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // Invisible incoming controls must not receive accidental clicks.
                 if app.content.sample(std::time::Instant::now()).0[2]<0.9 {return 0;}
                 let mut client=std::mem::zeroed::<RECT>(); GetClientRect(hwnd,&mut client);
-                x-=(((client.right-app.px(layout::PANEL_W))/2) as f32/app.scale).round() as i32;
+                x=((lp as i16 as i32-app.panel_left(hwnd,client.right)) as f32/app.scale) as i32;
                 if layout::utility_hit(x,y,layout::SETTINGS_LEFT) {
                     app.toggle_settings();app.resize(hwnd);return 0;
                 }
                 if layout::utility_hit(x,y,layout::CONTROL_LEFT) {app.toggle_control(hwnd);return 0;}
-                if (layout::NAV_TOP..layout::NAV_BOTTOM).contains(&y) && (16..296).contains(&x) {
+                if layout::utility_hit(x,y,layout::BLUETOOTH_LEFT) {app.toggle_bluetooth(hwnd);return 0;}
+                if (layout::NAV_TOP..layout::NAV_BOTTOM).contains(&y) && (16..layout::NAV_RIGHT).contains(&x) {
                     let slot=((x-16)/layout::TAB_STEP).min(4) as usize;
                     app.tab=layout::TABS[slot];app.resize(hwnd);return 0;
                 }
@@ -521,11 +615,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if app.floating {ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION as usize,0);}
                     return 0;
                 }
-                if !matches!(app.tab,7|8|9) && app.osd.opacity(std::time::Instant::now())>0. && (layout::Rect{x:70,y:54,w:260,h:42}).contains(x,y) {return 0;}
+                if app.osd_overlay() && (layout::Rect{x:70,y:54,w:260,h:42}).contains(x,y) {return 0;}
                 y+=layout::BODY_OFFSET;
             }
             if app.expanded && matches!(app.tab,7|9) {app.control_click(hwnd,x,y);
             } else if app.expanded && app.tab==8 {app.effects_click(hwnd,x,y);
+            } else if app.expanded && app.tab==10 {app.general_click(hwnd,x,y);
+            } else if app.expanded && app.tab==11 {app.spectrum_click(hwnd,x,y);
+            } else if app.expanded && app.tab==12 {app.power_click(hwnd,x,y);
             } else if app.expanded && app.tab==5 && y>=84 {
                 app.todo_click(hwnd,x,y);
             } else if app.expanded && app.tab==4 && y>=84 {
@@ -550,8 +647,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     _=>{}
                 }
                 InvalidateRect(hwnd, null(), 0);
-            } else if app.expanded && app.tab == 2 && (196..228).contains(&y) && ((20..132).contains(&x) || (144..232).contains(&x)) {
-                if x < 132 {
+            } else if app.expanded && app.tab == 2 && layout::body_action(2,x,y).is_some() {
+                if layout::body_action(2,x,y)==Some(layout::Action::FocusToggle) {
                     if app.focus_end.is_some() { app.focus_end = None; }
                     else {
                         if app.focus_left == 0 { app.focus_left = 1500; }
@@ -559,9 +656,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                 } else { app.focus_left = 1500; app.focus_end = None; }
                 InvalidateRect(hwnd, null(), 0);
-            } else if app.expanded && app.tab == 3 && (196..228).contains(&y) && ((20..132).contains(&x) || (144..256).contains(&x) || (268..380).contains(&x)) {
-                if x < 132 { app.water_ml = app.water_ml.saturating_add(200); }
-                else if x < 256 { app.water_ml = app.water_ml.saturating_add(400); }
+            } else if app.expanded && app.tab == 3 && layout::body_action(3,x,y).is_some() {
+                if layout::body_action(3,x,y)==Some(layout::Action::Water200) { app.water_ml = app.water_ml.saturating_add(200); }
+                else if layout::body_action(3,x,y)==Some(layout::Action::Water400) { app.water_ml = app.water_ml.saturating_add(400); }
                 else { app.water_ml = 0; }
                 if let Err(error) = water::save(&app.water_day, app.water_ml) {
                     OutputDebugStringW(wide(&format!("Lieve: cannot save water log: {error}")).as_ptr());
@@ -576,12 +673,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_LBUTTONUP if app.system_drag.is_some()=> {let kind=app.system_drag.take();ReleaseCapture();if kind==Some(system_ui::Drag::Transparency) {app.save();}app.tracking=false;SetTimer(hwnd,3,180,None);0}
+        WM_LBUTTONUP if app.system_drag.is_some()=> {let kind=app.system_drag.take();ReleaseCapture();if matches!(kind,Some(system_ui::Drag::Transparency|system_ui::Drag::Sensitivity)) {app.save();}app.tracking=false;SetTimer(hwnd,3,180,None);0}
         WM_LBUTTONUP if app.dragging_glow => {
             app.dragging_glow=false; ReleaseCapture(); app.save(); 0
         }
         WM_CAPTURECHANGED => {
-            if app.system_drag.take()==Some(system_ui::Drag::Transparency) {app.save();}
+            if matches!(app.system_drag.take(),Some(system_ui::Drag::Transparency|system_ui::Drag::Sensitivity)) {app.save();}
             if app.dragging_glow {app.dragging_glow=false; app.save();}
             0
         }
@@ -611,6 +708,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             else {app.shelf_offset=app.shelf_offset.saturating_sub(1);}
             InvalidateRect(hwnd,null(),0); 0
         }
+        WM_MOUSEWHEEL if app.expanded && app.tab==9=>{
+            if ((wp>>16) as i16)<0 {app.bluetooth_offset=(app.bluetooth_offset+1).min(app.system.devices.connected.len().saturating_sub(4));}
+            else{app.bluetooth_offset=app.bluetooth_offset.saturating_sub(1);}InvalidateRect(hwnd,null(),0);0
+        }
         WM_CONTEXTMENU => {
             app.menu_open = true;
             app.menu(hwnd);
@@ -634,7 +735,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER | WM_FRAME if msg==WM_FRAME || wp==2 => {
+            if app.hidden_fullscreen {app.clock.stop(hwnd);return 0;}
             let now=std::time::Instant::now();
+            let motion=app.motion_enabled;app.spectrum_visual.tick(now,motion);
             if !app.expanded && app.mascot {app.refresh_gaze(hwnd,now);}
             if let Some(t) = &app.transition {
                 let (frame,_,settled)=t.sample(now);
@@ -643,6 +746,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             InvalidateRect(hwnd,null(),0);
             if app.transition.is_none() && app.content.sample(now).1 && app.tab_pill.sample(now).1
+                && !app.spectrum_visual.moving()
                 && (!app.motion_enabled || (app.blink.sample(now).1 && app.gaze.sample(now).1 && (!app.devil_grin || app.grin.sample(now).1) && !app.osd.moving(now))) {app.clock.stop(hwnd);}
             0
         }
@@ -655,19 +759,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER if wp == 4 => {
-            if app.motion_enabled && app.mascot && ((app.expanded && app.tab==6) || (!app.expanded && !app.minimal && !(app.is_playing() && app.compact_lyrics))) {
+            if !app.hidden_fullscreen && app.motion_enabled && app.mascot && ((app.expanded && app.tab==6) || (!app.expanded && !app.minimal && !(app.is_playing() && app.compact_lyrics))) {
                 app.blink.start(std::time::Instant::now()); app.clock.start(hwnd);
             }
             SetTimer(hwnd,4,app.blink.delay_ms(),None); 0
         }
         WM_TIMER if wp == 5 => {app.refresh_gaze(hwnd,std::time::Instant::now()); 0}
-        WM_TIMER if wp==7 => {app.system_updates(hwnd);0}
+        WM_TIMER if wp==7 => {app.navigation.allow_hover();app.refresh_visibility(hwnd,false);app.system_updates(hwnd);app.refresh_spectrum(hwnd);0}
+        WM_TIMER if wp==9 => {app.update_spectrum(hwnd);0}
         WM_TIMER if wp==8 => {
             if let Some(delay)=app.osd.expiry_delay(std::time::Instant::now()) {SetTimer(hwnd,8,delay,None);}
             else {KillTimer(hwnd,8);app.resize(hwnd);app.clock.start(hwnd);}0
         }
         WM_TIMER if wp == 6 => {
-            if app.motion_enabled && app.devil_grin && app.mascot && ((app.expanded && app.tab==6) || (!app.expanded && !app.minimal && !(app.is_playing() && app.compact_lyrics))) {
+            if !app.hidden_fullscreen && app.motion_enabled && app.devil_grin && app.mascot && ((app.expanded && app.tab==6) || (!app.expanded && !app.minimal && !(app.is_playing() && app.compact_lyrics))) {
                 app.grin.start(std::time::Instant::now());app.clock.start(hwnd);
             }
             0
@@ -675,21 +780,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TIMER => {
             let previous_size = app.size();
             let mut changed = false;
-            if app.ticks % 30 == 0 {
-                let snapshot = power::read();
-                changed |= snapshot != app.power.snapshot;
-                if let Some(percent) = app.power.update(snapshot) {
-                    let mut notice = std::mem::zeroed::<NOTIFYICONDATAW>();
-                    notice.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                    notice.hWnd = hwnd; notice.uID = 1; notice.uFlags = NIF_INFO;
-                    notice.dwInfoFlags = NIIF_WARNING;
-                    let title = wide("Lieve — low battery");
-                    notice.szInfoTitle[..title.len()].copy_from_slice(&title);
-                    let text = wide(&format!("Battery at {percent}%. Connect your charger when you can."));
-                    notice.szInfo[..text.len()].copy_from_slice(&text);
-                    Shell_NotifyIconW(NIM_MODIFY, &notice);
-                }
-            }
+            app.refresh_power(hwnd);
             let today = water::today();
             if today != app.water_day {
                 app.water_day = today;
@@ -737,7 +828,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DISPLAYCHANGE | WM_EXITSIZEMOVE => { app.clock.monitor_changed(hwnd); app.resize(hwnd); 0 }
-        WM_CLOSE => { DestroyWindow(hwnd); 0 }
+        WM_CLOSE => {app.navigation.release(hwnd);DestroyWindow(hwnd);0}
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
@@ -772,31 +863,38 @@ fn main() {
             settings_return:0,
             restart_requested:false,
             clock:frame_clock::FrameClock::new(),surfaces:RefCell::new(render::Surfaces::new()),
-            eye_surface:RefCell::new(render::Surface::new()),region_shape:None,
+            eye_surface:RefCell::new(render::Surface::new()),region_shape:None,dock_bounds:None,pending_frame:Cell::new(None),
             eye_raster:RefCell::new(render::Raster::new()),cover_cache:RefCell::new(render::CoverCache::new()),
             shapes:RefCell::new(render::ShapeCache::new()),
             glass:glass::Glass::new(),glass_raster:RefCell::new(render::Raster::new()),glass_upload:RefCell::new(render::Surface::new()),
             transparency:settings.transparency,frosted:settings.frosted,system:system_control::Snapshot::default(),system_controller,system_updates,
+            fullscreen_auto_hide:settings.fullscreen_auto_hide,hidden_fullscreen:false,desktop_check:std::time::Instant::now(),autostart_enabled:autostart::enabled().unwrap_or(false),
             system_drag:None,osd:osd::Hud::new(),control_return:0,
-            icons:RefCell::new(icons::Renderer::new()),hover:layout::Hover::None,caption_font:font(10.,600),
+            bluetooth_return:0,bluetooth_offset:0,power_subscription:None,
+            spectrum:spectrum::Capture::start(),spectrum_visual:spectrum::Visual::new(),
+            spectrum_preferences:settings.spectrum,
+            navigation:keyboard::Navigation::new(),hotkey_registered:false,
+            metric_font:font(32.,600),icons:RefCell::new(icons::Renderer::new()),hover:layout::Hover::None,caption_font:font(10.,400),
             power: power::Monitor::new(power::read()),
             scale, font:font(16., 600), small_font:font(12., 400) }));
         let hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, class.as_ptr(), wide("Lieve").as_ptr(), WS_POPUP,
             0, 0, 196, 36, null_mut(), null_mut(), instance, (&*app as *const RefCell<App>).cast_mut().cast());
         if hwnd.is_null() { return; }
+        app.borrow_mut().power_subscription=Some(power::Subscription::new(hwnd));
+        app.borrow_mut().hotkey_registered=RegisterHotKey(hwnd,keyboard::HOTKEY_ID,MOD_CONTROL|MOD_ALT|MOD_NOREPEAT,VK_SPACE as u32)!=0;
         let focus=std::env::args().find_map(|arg|restart::Focus::parse(&arg)).unwrap_or(restart::Focus::Paused(1500))
             .restore(std::time::Instant::now(),std::time::SystemTime::now());
         app.borrow_mut().focus_left=focus.0;app.borrow_mut().focus_end=focus.1;
         app.borrow_mut().clock.monitor_changed(hwnd);
         app.borrow_mut().resize(hwnd);
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        app.borrow_mut().refresh_visibility(hwnd,true);
+        if !app.borrow().hidden_fullscreen {ShowWindow(hwnd, SW_SHOWNOACTIVATE);}
         app.borrow_mut().refresh_gaze(hwnd,std::time::Instant::now());
         DragAcceptFiles(hwnd,1);
         tray(hwnd, NIM_ADD);
         SetTimer(hwnd, 1, 1000, None);
         SetTimer(hwnd,7,100,None);
-        SetTimer(hwnd, 4, 4200, None);
-        if settings.devil_grin {SetTimer(hwnd,6,12000,None);}
+        if !app.borrow().hidden_fullscreen {SetTimer(hwnd, 4, 4200, None);if settings.devil_grin {SetTimer(hwnd,6,12000,None);}}
         let mut msg = std::mem::zeroed::<MSG>();
         'messages: loop {
             // Bound message draining so heavy input cannot starve an armed frame.
@@ -820,6 +918,7 @@ fn main() {
         let resume={let state=app.borrow();state.restart_requested.then(||restart::Focus::capture(state.focus_left,state.focus_end,std::time::Instant::now(),std::time::SystemTime::now()))};
         DeleteObject(app.borrow().small_font);
         DeleteObject(app.borrow().title_font);
+        DeleteObject(app.borrow().metric_font);
         DeleteObject(app.borrow().caption_font);
         drop(app);
         if let Some(focus)=resume {if let Err(error)=restart::launch(focus) {

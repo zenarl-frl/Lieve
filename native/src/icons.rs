@@ -2,13 +2,19 @@ use crate::render::{Surface,Raster};
 use windows_sys::Win32::Foundation::{POINT,RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
-#[derive(Clone,Copy)]
-pub enum Glyph {Play,Pause,Previous,Next,Lyrics,Settings,Control,Volume,Muted,Brightness,Wifi,Bluetooth}
-pub struct Renderer {surface:Surface,raster:Raster}
+#[derive(Clone,Copy,PartialEq,Eq)]
+pub enum Glyph {Play,Pause,Previous,Next,Lyrics,Settings,Control,Volume,Muted,Brightness,Wifi,Bluetooth,Close,Edit,File,Check,Clock,Drop}
+#[derive(Clone,Copy,PartialEq,Eq)]
+struct Key {pixels:i32,glyph:Glyph,color:u32,background:u32,disc:Option<u32>}
+pub struct Renderer {surface:Surface,cache:Vec<(Key,Raster)>}
 impl Renderer {
-    pub fn new()->Self {Self {surface:Surface::new(),raster:Raster::new()}}
+    pub fn new()->Self {Self {surface:Surface::new(),cache:Vec::new()}}
     pub unsafe fn draw(&mut self,target:HDC,scale:f32,x:i32,y:i32,size:i32,glyph:Glyph,color:u32,background:u32,disc:Option<u32>) {
         let pixels=(size as f32*scale).round() as i32;let high=pixels*4;
+        let key=Key{pixels,glyph,color,background,disc};
+        if let Some((_,image))=self.cache.iter().find(|(stored,_)|*stored==key) {
+            image.draw(target,(x as f32*scale).round() as i32,(y as f32*scale).round() as i32);return;
+        }
         if !self.surface.ensure(target,high,high) {return;}
         let dc=self.surface.dc;
         let fill=CreateSolidBrush(background);FillRect(dc,&RECT{left:0,top:0,right:high,bottom:high},fill);DeleteObject(fill);
@@ -23,6 +29,22 @@ impl Renderer {
         let point=|x:f64,y:f64|POINT{x:p(x),y:p(y)};
         let brush=CreateSolidBrush(color);SelectObject(dc,brush);
         match glyph {
+            Glyph::Close|Glyph::Edit|Glyph::File|Glyph::Check|Glyph::Clock|Glyph::Drop=>{
+                SelectObject(dc,GetStockObject(NULL_BRUSH));
+                let pen=CreatePen(PS_SOLID,(high as f64/24.*1.6).round().max(1.) as i32,color);SelectObject(dc,pen);
+                match glyph {
+                    Glyph::Close=>{MoveToEx(dc,p(6.),p(6.),std::ptr::null_mut());LineTo(dc,p(18.),p(18.));MoveToEx(dc,p(18.),p(6.),std::ptr::null_mut());LineTo(dc,p(6.),p(18.));},
+                    Glyph::Edit=>{let points=[point(5.,21.),point(6.,16.),point(16.,6.),point(20.,10.),point(10.,20.),point(5.,21.)];Polyline(dc,points.as_ptr(),points.len() as i32);MoveToEx(dc,p(14.),p(8.),std::ptr::null_mut());LineTo(dc,p(18.),p(12.));},
+                    Glyph::File=>{let points=[point(5.,3.),point(14.,3.),point(20.,9.),point(20.,21.),point(5.,21.),point(5.,3.)];Polyline(dc,points.as_ptr(),points.len() as i32);
+                        MoveToEx(dc,p(14.),p(3.),std::ptr::null_mut());LineTo(dc,p(14.),p(9.));LineTo(dc,p(20.),p(9.));
+                        for y in [13.,17.] {MoveToEx(dc,p(8.),p(y),std::ptr::null_mut());LineTo(dc,p(16.),p(y));}},
+                    Glyph::Check=>{let points=[point(5.,12.),point(10.,17.),point(19.,7.)];Polyline(dc,points.as_ptr(),3);},
+                    Glyph::Clock=>{Ellipse(dc,p(3.),p(3.),p(21.),p(21.));MoveToEx(dc,p(12.),p(6.),std::ptr::null_mut());LineTo(dc,p(12.),p(12.));LineTo(dc,p(16.),p(14.));},
+                    Glyph::Drop=>{let points=[point(12.,3.),point(10.,7.),point(5.,12.),point(5.,16.),point(5.,23.),point(19.,23.),point(19.,16.),point(19.,12.),point(14.,7.),point(12.,3.)];PolyBezier(dc,points.as_ptr(),10);},
+                    _=>{},
+                }
+                SelectObject(dc,GetStockObject(NULL_PEN));DeleteObject(pen);
+            },
             Glyph::Play=> {let points=[point(9.,5.),point(20.,12.),point(9.,19.)];Polygon(dc,points.as_ptr(),3);}
             Glyph::Pause=> {for x in [7.,14.] {Rectangle(dc,p(x),p(5.),p(x+3.),p(19.));}}
             Glyph::Previous|Glyph::Next=> {
@@ -65,7 +87,9 @@ impl Renderer {
             }
         }
         SelectObject(dc,old_brush);SelectObject(dc,old_pen);DeleteObject(brush);
-        self.surface.resolve(&mut self.raster,pixels,pixels,4);
-        self.raster.draw(target,(x as f32*scale).round() as i32,(y as f32*scale).round() as i32);
+        let mut raster=Raster::new();self.surface.resolve(&mut raster,pixels,pixels,4);
+        raster.draw(target,(x as f32*scale).round() as i32,(y as f32*scale).round() as i32);
+        if self.cache.len()>=48 {self.cache.remove(0);}
+        self.cache.push((key,raster));
     }
 }

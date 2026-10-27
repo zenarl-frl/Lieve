@@ -64,7 +64,7 @@ impl App {
 
     pub unsafe fn panel(&self, dc: HDC) {
         let muted=rgb(135,135,151);
-        self.framed_tile(dc,layout::Rect{x:16,y:10,w:280,h:28},14,rgb(17,17,24),rgb(32,32,44));
+        self.framed_tile(dc,layout::Rect{x:16,y:10,w:layout::NAV_RIGHT-16,h:28},14,rgb(17,17,24),rgb(32,32,44));
         if layout::tab_slot(self.tab).is_some() {
             let x=self.tab_pill.sample(std::time::Instant::now()).0.round() as i32;
             self.tile(dc,x,12,layout::TAB_PILL_W,24,12,rgb(39,30,43));
@@ -75,14 +75,17 @@ impl App {
             let color=if active {rgb(240,237,246)}else if self.hover==layout::Hover::Tab(i) {rgb(215,215,228)}else{muted};
             self.fitted_text(dc,label,layout::Rect{x,y:12,w:layout::TAB_PILL_W,h:24},self.small_font,color,DT_CENTER);
         }
-        let center_bg=if matches!(self.tab,7|9) {rgb(31,35,53)}else if self.hover==layout::Hover::Control {rgb(29,29,41)}else{rgb(17,17,24)};
+        let bt_bg=if self.tab==9 {rgb(31,35,53)}else if self.hover==layout::Hover::Bluetooth {rgb(29,29,41)}else{rgb(17,17,24)};
+        self.framed_tile(dc,layout::Rect{x:layout::BLUETOOTH_LEFT,y:10,w:32,h:28},12,bt_bg,rgb(32,32,44));
+        self.icon(dc,layout::BLUETOOTH_LEFT+7,15,18,icons::Glyph::Bluetooth,if self.tab==9 {rgb(126,178,255)}else{rgb(170,170,188)},bt_bg,None);
+        let center_bg=if self.tab==7 {rgb(31,35,53)}else if self.hover==layout::Hover::Control {rgb(29,29,41)}else{rgb(17,17,24)};
         self.framed_tile(dc,layout::Rect{x:layout::CONTROL_LEFT,y:10,w:32,h:28},12,center_bg,rgb(32,32,44));
-        self.icon(dc,layout::CONTROL_LEFT+7,15,18,icons::Glyph::Control,if matches!(self.tab,7|9) {rgb(126,178,255)}else{rgb(170,170,188)},center_bg,None);
-        let bg=if matches!(self.tab,6|8) {rgb(43,29,44)}else if self.hover==layout::Hover::Settings {rgb(29,29,41)}else{rgb(17,17,24)};
+        self.icon(dc,layout::CONTROL_LEFT+7,15,18,icons::Glyph::Control,if self.tab==7 {rgb(126,178,255)}else{rgb(170,170,188)},center_bg,None);
+        let bg=if matches!(self.tab,6|8|10|11|12) {rgb(43,29,44)}else if self.hover==layout::Hover::Settings {rgb(29,29,41)}else{rgb(17,17,24)};
         self.framed_tile(dc,layout::Rect{x:layout::SETTINGS_LEFT,y:10,w:32,h:28},12,bg,rgb(32,32,44));
-        self.icon(dc,layout::SETTINGS_LEFT+7,15,18,icons::Glyph::Settings,if matches!(self.tab,6|8) {self.color}else{rgb(170,170,188)},bg,None);
+        self.icon(dc,layout::SETTINGS_LEFT+7,15,18,icons::Glyph::Settings,if matches!(self.tab,6|8|10|11|12) {self.color}else{rgb(170,170,188)},bg,None);
         SaveDC(dc);SetViewportOrgEx(dc,0,-self.px(layout::BODY_OFFSET),std::ptr::null_mut());
-        self.panel_body(dc);RestoreDC(dc,-1);
+        self.panel_body(dc);RestoreDC(dc,-1);self.keyboard_focus(dc);
     }
 
     pub(super) unsafe fn fitted_text(&self,dc:HDC,text:&str,rect:layout::Rect,font:HFONT,color:u32,align:u32) {
@@ -101,6 +104,29 @@ impl App {
         self.icons.borrow_mut().draw(dc,self.scale,x,y,size,glyph,color,bg,disc);
     }
 
+    pub(super) unsafe fn refresh_spectrum(&mut self,hwnd:HWND) {
+        let enabled=self.spectrum_preferences.enabled && !self.hidden_fullscreen && self.media.available && self.is_playing() && ((!self.expanded && self.compact_lyrics) || (self.expanded && matches!(self.tab,0|1)));
+        if self.spectrum.enable(enabled) && enabled {SetTimer(hwnd,9,33,None);}
+        self.update_spectrum(hwnd);
+    }
+    pub(super) unsafe fn update_spectrum(&mut self,hwnd:HWND) {
+        let now=std::time::Instant::now();self.spectrum_visual.target(self.spectrum.reading().sensitivity(self.spectrum_preferences.sensitivity),self.spectrum.enabled(),now);
+        if !self.motion_enabled {
+            let before=self.spectrum_visual.bars;self.spectrum_visual.tick(now,false);
+            if before!=self.spectrum_visual.bars {InvalidateRect(hwnd,std::ptr::null(),0);}
+        } else if self.spectrum_visual.moving() {self.clock.start(hwnd);}
+        if !self.spectrum.enabled() && self.spectrum_visual.flat() {KillTimer(hwnd,9);}
+    }
+    pub(super) unsafe fn draw_spectrum(&self,dc:HDC,rect:layout::Rect,background:u32) {
+        let step=rect.w as f32/spectrum::BANDS as f32;
+        for (i,level) in self.spectrum_visual.bars.iter().enumerate() {
+            let height=(2.+(rect.h-2) as f32*level).round() as i32;
+            let x=rect.x+(i as f32*step).round() as i32;
+            let w=((i+1) as f32*step).round() as i32-(i as f32*step).round() as i32-1;
+            let color=if *level>0.01 {if self.spectrum_preferences.white {rgb(239,239,247)}else{self.color}}else{rgb(62,62,78)};
+            self.smooth_tile(dc,layout::Rect{x,y:rect.y+(rect.h-height)/2,w:w.max(1),h:height},w.max(1),color,background);
+        }
+    }
     unsafe fn music(&self,dc:HDC) {
         let title=if self.media.available {self.media.title.as_str()}else{"Paper Sky"};
         let artist=if self.media.available {self.media.artist.as_str()}else{"Lumen Coast"};
@@ -138,13 +164,18 @@ impl App {
         self.tile(dc,24,190,352,3,3,rgb(39,39,51));
         let progress=(352*position/duration) as i32;
         if progress>0 {self.tile(dc,24,190,progress,3,3,self.color);}
+        if self.hover==layout::Hover::Action(layout::Action::Seek) {
+            self.smooth_tile(dc,layout::Rect{x:20+progress,y:188,w:8,h:8},8,theme::TEXT,bg);
+        }
         self.fitted_text(dc,&format!("{}:{:02}",position/60,position%60),layout::Rect{x:24,y:197,w:64,h:16},self.caption_font,muted,DT_LEFT);
         let left=duration.saturating_sub(position);
         self.fitted_text(dc,&format!("-{}:{:02}",left/60,left%60),layout::Rect{x:312,y:197,w:64,h:16},self.caption_font,muted,DT_RIGHT);
 
         self.tile(dc,24,220,48,28,10,rgb(14,14,20));
         let status=if !self.media.available {"DEMO"}else if self.is_playing() {"PLAYING"}else{"PAUSED"};
-        self.fitted_text(dc,status,layout::Rect{x:26,y:220,w:44,h:28},self.caption_font,rgb(119,119,142),DT_CENTER);
+        if self.spectrum_preferences.enabled && self.media.available && (self.is_playing() || !self.spectrum_visual.flat()) {
+            self.draw_spectrum(dc,layout::Rect{x:28,y:224,w:40,h:20},rgb(14,14,20));
+        }else {self.fitted_text(dc,status,layout::Rect{x:26,y:220,w:44,h:28},self.caption_font,rgb(119,119,142),DT_CENTER);}
         for (rect,action,glyph) in [(layout::MUSIC_PREVIOUS,layout::MusicAction::Previous,icons::Glyph::Previous),
             (layout::MUSIC_NEXT,layout::MusicAction::Next,icons::Glyph::Next)] {
             let hovered=self.hover==layout::Hover::Music(action);let surface=if hovered {rgb(24,24,34)}else{bg};
@@ -164,6 +195,9 @@ impl App {
         let muted = rgb(135,135,151);
         let white = rgb(240,240,245);
         match self.tab {
+            12=>{self.power_view(dc);return;}
+            10=>{self.general_view(dc);return;}
+            11=>{self.spectrum_view(dc);return;}
             7|9=>{self.control_view(dc);return;}
             8=>{self.effects_view(dc);return;}
             5 => {self.todo_view(dc); return;}
@@ -171,25 +205,32 @@ impl App {
             6 => { self.appearance(dc); return; }
             0|1 => {self.music(dc);}
             2 => {
-                self.text(dc,"FOCUS TIME",24,94,muted,true);
-                self.text(dc,&format!("{:02}:{:02}",self.focus_left/60,self.focus_left%60),24,128,white,false);
-                self.text(dc,"Keeps running when the notch is closed",24,160,muted,true);
-                self.smooth_tile(dc,layout::Rect{x:20,y:196,w:112,h:32},16,self.color,rgb(8,8,11));
-                self.fitted_text(dc,if self.focus_end.is_some() {"Pause"} else {"Start"},layout::Rect{x:20,y:196,w:112,h:32},self.small_font,rgb(8,8,11),DT_CENTER);
-                self.smooth_tile(dc,layout::Rect{x:144,y:196,w:88,h:32},16,rgb(30,30,38),rgb(8,8,11));
-                self.fitted_text(dc,"Reset",layout::Rect{x:144,y:196,w:88,h:32},self.small_font,white,DT_CENTER);
+                self.framed_tile(dc,layout::Rect{x:16,y:88,w:368,h:98},20,theme::CARD,theme::BORDER);
+                self.fitted_text(dc,"FOCUS SESSION",layout::Rect{x:28,y:100,w:220,h:14},self.caption_font,theme::MUTED,DT_LEFT);
+                let status=if self.focus_end.is_some() {"RUNNING"}else if self.focus_left==0 {"COMPLETE"}else if self.focus_left<1500 {"PAUSED"}else{"READY"};
+                self.smooth_tile(dc,layout::Rect{x:276,y:100,w:96,h:18},8,theme::LIFT,theme::CARD);
+                self.fitted_text(dc,status,layout::Rect{x:276,y:100,w:96,h:18},self.caption_font,theme::TEXT,DT_CENTER);
+                self.fitted_text(dc,&format!("{:02}:{:02}",self.focus_left/60,self.focus_left%60),layout::Rect{x:28,y:118,w:232,h:48},self.metric_font,theme::TEXT,DT_LEFT);
+                self.fitted_text(dc,"25-minute session",layout::Rect{x:28,y:166,w:232,h:12},self.caption_font,theme::MUTED,DT_LEFT);
+                self.icon(dc,310,132,36,icons::Glyph::Clock,self.color,theme::CARD,None);
+                self.action_button(dc,layout::FOCUS_TOGGLE,if self.focus_end.is_some() {"Pause"}else{"Start"},ui::Button::Primary,layout::Action::FocusToggle);
+                self.action_button(dc,layout::FOCUS_RESET,"Reset",ui::Button::Secondary,layout::Action::FocusReset);
+                self.fitted_text(dc,&format!("{}% done",(1500-self.focus_left.min(1500))*100/1500),layout::Rect{x:272,y:196,w:100,h:32},self.caption_font,theme::MUTED,DT_RIGHT);
+                self.fitted_text(dc,"Keeps running when the notch is closed",layout::Rect{x:20,y:240,w:360,h:14},self.caption_font,theme::MUTED,DT_CENTER);
             }
             3 => {
-                self.text(dc,"TODAY / WATER INTAKE",24,94,muted,true);
-                self.text(dc,&format!("{:.1} / 1.5 L",self.water_ml as f32/1000.),24,128,white,false);
-                self.tile(dc,24,164,352,7,7,rgb(36,36,44));
-                let width=(352*self.water_ml.min(1500)/1500) as i32;
-                if width>0 { self.tile(dc,24,164,width,7,7,self.color); }
-                for (x,label) in [(20,"+200 ml"),(144,"+400 ml"),(268,"Reset")] {
-                    self.smooth_tile(dc,layout::Rect{x,y:196,w:112,h:32},16,rgb(36,26,32),rgb(8,8,11));
-                    self.fitted_text(dc,label,layout::Rect{x,y:196,w:112,h:32},self.small_font,self.color,DT_CENTER);
-                }
-                self.text(dc,"Saved locally · resets each new day",24,240,muted,true);
+                self.framed_tile(dc,layout::Rect{x:16,y:88,w:368,h:98},20,theme::CARD,theme::BORDER);
+                self.fitted_text(dc,"DAILY HYDRATION",layout::Rect{x:28,y:100,w:220,h:14},self.caption_font,theme::MUTED,DT_LEFT);
+                self.fitted_text(dc,"GOAL 1.5 L",layout::Rect{x:264,y:100,w:108,h:14},self.caption_font,theme::MUTED,DT_RIGHT);
+                self.fitted_text(dc,&format!("{:.1} L",self.water_ml as f32/1000.),layout::Rect{x:28,y:118,w:232,h:48},self.metric_font,theme::TEXT,DT_LEFT);
+                self.icon(dc,292,130,22,icons::Glyph::Drop,self.color,theme::CARD,None);
+                self.fitted_text(dc,&format!("{}%",self.water_ml.min(1500)*100/1500),layout::Rect{x:316,y:128,w:56,h:28},self.font,theme::TEXT,DT_RIGHT);
+                self.tile(dc,28,172,344,5,5,theme::RAIL);let width=(344*self.water_ml.min(1500)/1500) as i32;
+                if width>0 {self.tile(dc,28,172,width,5,5,self.color);}
+                self.action_button(dc,layout::WATER_BUTTONS[0],"+200 ml",ui::Button::Primary,layout::Action::Water200);
+                self.action_button(dc,layout::WATER_BUTTONS[1],"+400 ml",ui::Button::Secondary,layout::Action::Water400);
+                self.action_button(dc,layout::WATER_BUTTONS[2],"Reset",ui::Button::Quiet,layout::Action::WaterReset);
+                self.fitted_text(dc,"Saved locally · resets each new day",layout::Rect{x:20,y:240,w:360,h:14},self.caption_font,theme::MUTED,DT_CENTER);
             }
             _ => {
                 let (title,detail)=match self.tab {

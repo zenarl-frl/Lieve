@@ -31,7 +31,7 @@ fn coverage(x:i32,y:i32,w:i32,h:i32,radius:i32,floating:bool)->f64 {
     for sy in 0..4 {for sx in 0..4 {let dx=x as f64+(sx as f64+0.5)/4.-cx;let dy=y as f64+(sy as f64+0.5)/4.-cy;if dx*dx+dy*dy<=r*r {inside+=1;}}}
     inside as f64/16.
 }
-pub unsafe fn present(hwnd:HWND,source:&crate::render::Surface,output:&mut crate::render::Raster,upload:&mut crate::render::Surface,width:i32,height:i32,transparency:u32,radius:i32,floating:bool,opaque:&[Opaque])->bool {
+pub unsafe fn present(hwnd:HWND,source:&crate::render::Surface,output:&mut crate::render::Raster,upload:&mut crate::render::Surface,width:i32,height:i32,transparency:u32,radius:i32,floating:bool,opaque:&[Opaque],position:Option<(i32,i32)>)->bool {
     source.copy_pixels(output,width,height);let base=opacity(transparency) as u32;
     for y in 0..height {for x in 0..width {
         let at=(y as usize*width as usize+x as usize)*4;
@@ -44,7 +44,7 @@ pub unsafe fn present(hwnd:HWND,source:&crate::render::Surface,output:&mut crate
         let alpha=(alpha as f64*coverage(x,y,width,height,radius,floating)).round() as u32;
         for c in 0..3 {color[c]=((color[c] as u32*alpha+127)/255) as u8;}color[3]=alpha as u8;
     }}
-    output.upload_layered(hwnd,upload)
+    output.upload_layered(hwnd,upload,position)
 }
 #[cfg(test)] mod tests {
     use super::*;

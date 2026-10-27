@@ -9,6 +9,10 @@ impl Motion {
     fn label(self)->&'static str {match self {Self::System=>"system",Self::Full=>"full",Self::Reduced=>"reduced"}}
 }
 
+#[derive(Clone,Copy,Debug, PartialEq)]
+pub struct Spectrum {pub enabled:bool,pub sensitivity:u32,pub white:bool}
+impl Default for Spectrum {fn default()->Self {Self{enabled:true,sensitivity:100,white:false}}}
+
 #[derive(Debug, PartialEq)]
 pub struct Settings {
     pub motion: Motion,
@@ -16,6 +20,8 @@ pub struct Settings {
     pub devil_grin: bool,
     pub transparency:u32,
     pub frosted:bool,
+    pub fullscreen_auto_hide:bool,
+    pub spectrum:Spectrum,
     pub compact_lyrics: bool,
     pub glow: u32,
     pub color: u32,
@@ -25,7 +31,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { motion:Motion::System, mascot:true, devil_grin:false, transparency:25,frosted:true,compact_lyrics:true, glow:50, color: 226 | 54 << 8 | 54 << 16, floating: false, minimal: false }
+        Self { motion:Motion::System, mascot:true, devil_grin:false, transparency:25,frosted:true,fullscreen_auto_hide:true,spectrum:Spectrum::default(),compact_lyrics:true, glow:50, color: 226 | 54 << 8 | 54 << 16, floating: false, minimal: false }
     }
 }
 
@@ -48,6 +54,10 @@ impl Settings {
                     "mascot" => result.mascot = value != "false",
                     "devil_grin" => result.devil_grin = value == "true",
                     "frosted"=>result.frosted=value!="false",
+                    "fullscreen_auto_hide"=>result.fullscreen_auto_hide=value!="false",
+                    "spectrum_enabled"=>result.spectrum.enabled=value!="false",
+                    "spectrum_sensitivity"=>if let Ok(v)=value.parse::<u32>() {result.spectrum.sensitivity=v.clamp(50,200);},
+                    "spectrum_color"=>result.spectrum.white=value=="white",
                     "transparency"=>if let Ok(v)=value.parse::<u32>() {result.transparency=v.min(100);},
                     "compact_lyrics" => result.compact_lyrics = value != "false",
                     "glow" => if let Ok(glow)=value.parse::<u32>() { result.glow=glow.min(100); },
@@ -59,7 +69,7 @@ impl Settings {
     }
 
     fn encode(&self) -> String {
-        format!("color={}\nfloating={}\nminimal={}\nmascot={}\ncompact_lyrics={}\nglow={}\nmotion={}\ndevil_grin={}\ntransparency={}\nfrosted={}\n", self.color, self.floating, self.minimal,self.mascot,self.compact_lyrics,self.glow,self.motion.label(),self.devil_grin,self.transparency,self.frosted)
+        format!("color={}\nfloating={}\nminimal={}\nmascot={}\ncompact_lyrics={}\nglow={}\nmotion={}\ndevil_grin={}\ntransparency={}\nfrosted={}\nfullscreen_auto_hide={}\nspectrum_enabled={}\nspectrum_sensitivity={}\nspectrum_color={}\n", self.color, self.floating, self.minimal,self.mascot,self.compact_lyrics,self.glow,self.motion.label(),self.devil_grin,self.transparency,self.frosted,self.fullscreen_auto_hide,self.spectrum.enabled,self.spectrum.sensitivity,if self.spectrum.white {"white"}else{"accent"})
     }
 
     pub fn load() -> Self {
@@ -85,7 +95,7 @@ mod tests {
     use super::*;
     #[test]
     fn settings_round_trip() {
-        let original = Settings { motion:Motion::Full, color: 0x123456, floating: true, minimal: true, mascot:false, devil_grin:true,transparency:63,frosted:false, compact_lyrics:false, glow:77 };
+        let original = Settings { motion:Motion::Full, color: 0x123456, floating: true, minimal: true, mascot:false, devil_grin:true,transparency:63,frosted:false,fullscreen_auto_hide:false,spectrum:Spectrum{enabled:false,sensitivity:175,white:true}, compact_lyrics:false, glow:77 };
         assert_eq!(Settings::parse(&original.encode()), original);
     }
     #[test]
@@ -112,6 +122,17 @@ mod tests {
         assert_eq!(Settings::parse("transparency=oops").transparency,25);
         assert_eq!(Settings::parse("transparency=0\nfrosted=false").transparency,0);
         assert!(!Settings::parse("frosted=false").frosted);
+        assert!(Settings::parse("").fullscreen_auto_hide);
+        assert!(!Settings::parse("fullscreen_auto_hide=false").fullscreen_auto_hide);
+    }
+    #[test]
+    fn spectrum_defaults_and_invalid_preferences_are_bounded() {
+        assert_eq!(Settings::parse("").spectrum,Spectrum::default());
+        assert_eq!(Settings::parse("spectrum_sensitivity=0").spectrum.sensitivity,50);
+        assert_eq!(Settings::parse("spectrum_sensitivity=999").spectrum.sensitivity,200);
+        assert_eq!(Settings::parse("spectrum_sensitivity=invalid").spectrum.sensitivity,100);
+        assert!(!Settings::parse("spectrum_color=invalid").spectrum.white);
+        assert_eq!(Settings::parse("spectrum_enabled=false\nspectrum_color=white").spectrum,Spectrum{enabled:false,sensitivity:100,white:true});
     }
     #[test]
     fn missing_fields_and_unknown_keys_are_safe() {

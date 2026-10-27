@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use super::{App,wide,layout};
+use super::{App,wide,layout,theme,icons};
 use windows_sys::Win32::{Foundation::*,UI::{WindowsAndMessaging::*,Controls::Dialogs::*,Shell::*},Graphics::Gdi::*};
 
 const LIMIT: usize = 100;
@@ -87,26 +87,22 @@ impl App {
     }
 
     pub unsafe fn shelf_view(&self, dc:HDC) {
-        let muted=super::rgb(135,135,151);
+        let muted=theme::MUTED;
         if self.shelf.is_empty() {
-            self.text(dc,"Keep your files nearby",24,122,super::rgb(235,235,243),false);
-            self.text(dc,"Drop files here or use Add file.",24,155,muted,true);
-            self.text(dc,"Files stay in their original location.",24,177,muted,true);
+            self.empty_state(dc,icons::Glyph::File,"Keep your files close","Drop a file · Originals stay where they are.");
         }
         for (row,file) in self.shelf.iter().skip(self.shelf_offset).take(4).enumerate() {
             let y=layout::LIST_TOP+row as i32*layout::LIST_STEP;
-            self.tile(dc,layout::LIST_LEFT,y,layout::LIST_RIGHT-layout::LIST_LEFT,layout::LIST_ROW_H,12,super::rgb(23,23,30));
+            let bg=self.list_row_style(dc,row,y);self.icon(dc,26,y+6,16,icons::Glyph::File,muted,bg,None);
             let name=file.file_name().unwrap_or(file.as_os_str()).to_string_lossy();
-            SaveDC(dc); IntersectClipRect(dc,self.px(26),self.px(y),self.px(layout::REMOVE_LEFT-4),self.px(y+layout::LIST_ROW_H));
-            self.text(dc,&super::visual::shorten(&name,40),26,y+1,super::rgb(235,235,243),true);
+            self.fitted_text(dc,&name,layout::Rect{x:50,y:y+2,w:layout::REMOVE_LEFT-58,h:14},self.small_font,theme::TEXT,DT_LEFT);
             // Do not stat paths during paint: removable/network drives may be slow.
-            self.text(dc,"Click to open · reference",26,y+14,muted,true);
-            RestoreDC(dc,-1);
-            self.text(dc,"x",370,y+6,muted,true);
+            let parent=file.parent().map(|path|path.to_string_lossy()).unwrap_or_else(||"Local file reference".into());
+            self.fitted_text(dc,&parent,layout::Rect{x:50,y:y+16,w:layout::REMOVE_LEFT-58,h:11},self.caption_font,muted,DT_LEFT);
+            self.list_icon(dc,row,y,false,bg);
         }
-        self.tile(dc,layout::LIST_LEFT,layout::ADD_TOP,layout::LIST_RIGHT-layout::LIST_LEFT,layout::ADD_H,12,super::rgb(38,27,34));
-        self.fitted_text(dc,"+ Add file",layout::Rect{x:28,y:layout::ADD_TOP,w:240,h:layout::ADD_H},self.small_font,self.color,DT_LEFT);
-        self.fitted_text(dc,&format!("{} {}",self.shelf.len(),if self.shelf.len()==1 {"item"}else{"items"}),layout::Rect{x:272,y:layout::ADD_TOP,w:100,h:layout::ADD_H},self.small_font,muted,DT_RIGHT);
+        let count=if self.shelf.len()>4 {format!("{}–{} / {} files",self.shelf_offset+1,(self.shelf_offset+4).min(self.shelf.len()),self.shelf.len())}else{format!("{} {}",self.shelf.len(),if self.shelf.len()==1 {"item"}else{"items"})};
+        self.list_add_button(dc,if self.shelf.len()<100 {"+ Add file"}else{"File limit reached"},&count,layout::Action::ShelfAdd,self.shelf.len()<100);
     }
 }
 

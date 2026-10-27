@@ -26,6 +26,12 @@ impl Frame {
 
 pub struct Transition { pub from:Frame, pub to:Frame, pub velocity:[f64;5], pub started:Instant }
 impl Transition {
+    pub fn retarget(current:&mut Option<Self>,from:Frame,to:Frame,now:Instant) {
+        if current.as_ref().is_some_and(|t|t.to==to) {return;}
+        let velocity=current.as_ref().map(|t|t.sample(now).1).unwrap_or([0.;5]);
+        *current=if from==to && velocity.iter().all(|v|v.abs()<1.) {None}
+            else{Some(Self{from,to,velocity,started:now})};
+    }
     pub fn sample(&self, now:Instant)->(Frame,[f64;5],bool) {
         let t=now.saturating_duration_since(self.started).as_secs_f64();
         let from=self.from.values(); let to=self.to.values();
@@ -68,7 +74,8 @@ impl Content {
     pub fn retarget(&mut self,stage:Stage,now:Instant,motion:bool) {
         if self.stage==stage && motion {return;}
         let weights=self.sample(now).0;
-        self.exit=duration(self.stage)*weights.iter().copied().fold(0.,f64::max);
+        self.exit=weights.iter().enumerate().filter(|(i,_)|*i!=stage as usize)
+            .map(|(i,w)|w*match i {0=>0.18,2=>0.16,_=>0.14}).fold(0.,f64::max);
         self.from=weights; self.stage=stage; self.started=now; self.moving=motion;
     }
     pub fn sample(&self,now:Instant)->([f64;4],bool) {
@@ -80,8 +87,8 @@ impl Content {
         // AnimatePresence mode="wait": outgoing content exits before incoming enters.
         if elapsed<self.exit {
             let fade=1.-smooth(elapsed/self.exit);
-            for i in 0..4 {weights[i]=self.from[i]*fade;}
-        } else { weights[self.stage as usize]=smooth((elapsed-self.exit)/duration(self.stage)); }
+            for (i,weight) in weights.iter_mut().enumerate() {*weight=self.from[i]*if i==self.stage as usize {1.}else{fade};}
+        } else {let initial=self.from[self.stage as usize];weights[self.stage as usize]=initial+(1.-initial)*smooth((elapsed-self.exit)/duration(self.stage));}
         (weights,false)
     }
 }
@@ -126,6 +133,23 @@ impl Blink {
         let (next,next_v)=spring(x,144.,v,0.,SHELL);
         assert_eq!(next,x); assert!((next_v-v).abs()<1e-9);
         let (end,_)=spring(x,144.,v,1.2,SHELL); assert!((end-144.).abs()<0.001);
+    }
+    #[test] fn reversal_before_first_geometry_frame_cancels_the_old_target() {
+        let now=Instant::now();let idle=Frame{x:428,y:0,w:144,h:36,radius:20};
+        let panel=Frame{x:300,y:0,w:400,h:220,radius:22};let mut transition=None;
+        Transition::retarget(&mut transition,idle,panel,now);assert_eq!(transition.as_ref().unwrap().to,panel);
+        Transition::retarget(&mut transition,idle,idle,now);assert!(transition.is_none());
+        Transition::retarget(&mut transition,idle,panel,now);
+        let at=now+Duration::from_millis(1);let velocity=transition.as_ref().unwrap().sample(at).1;
+        Transition::retarget(&mut transition,idle,idle,at);
+        let t=transition.unwrap();assert_eq!(t.to,idle);assert_eq!(t.velocity,velocity);
+    }
+    #[test] fn returning_to_still_visible_content_never_fades_it_out_again() {
+        let now=Instant::now();let mut content=Content::new();content.retarget(Stage::Panel,now,true);
+        let reverse=now+Duration::from_millis(90);let before=content.sample(reverse).0[0];
+        content.retarget(Stage::Idle,reverse,true);
+        for i in 0..40 {assert!(content.sample(reverse+Duration::from_millis(i*10)).0[0]>=before);}
+        assert_eq!(content.sample(reverse+Duration::from_secs(1)),([1.,0.,0.,0.],true));
     }
     #[test] fn frame_has_exact_settled_target_and_keeps_docked_center() {
         let now=Instant::now();

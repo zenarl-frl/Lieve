@@ -1,22 +1,23 @@
 use std::{sync::mpsc::{self,Sender,Receiver},time::{Duration,Instant},ptr::null};
 use windows::{core::{BSTR,VARIANT,w},Win32::{System::{Com::*,Wmi::*,Rpc::*},Media::Audio::{*,Endpoints::*}}};
-use windows::{Devices::{Bluetooth::*,Enumeration::DeviceInformation,Radios::RadioState},Networking::Connectivity::*};
+use windows::Networking::Connectivity::*;
 
 #[derive(Clone,Debug,Default,PartialEq,Eq)]
 pub struct Audio {pub volume:Option<u8>,pub muted:bool}
 #[derive(Clone,Debug,PartialEq,Eq)]
-pub struct Devices {pub brightness:Option<u8>,pub wifi:String,pub wifi_connected:bool,pub bluetooth:String,pub connected:Vec<String>}
+pub struct Devices {pub brightness:Option<u8>,pub wifi:String,pub wifi_connected:bool,pub bluetooth:String,pub connected:Vec<crate::bluetooth::Device>}
 impl Default for Devices {fn default()->Self {Self{brightness:None,wifi:"Checking connection...".into(),wifi_connected:false,bluetooth:"Checking devices...".into(),connected:Vec::new()}}}
 #[derive(Default)] pub struct Snapshot {pub audio:Audio,pub devices:Devices,pub error:Option<(String,Instant)>}
-pub enum Update {Audio(Audio),Brightness(Option<u8>),Devices(Devices),Error(String)}
+pub enum Update {Audio(Audio),Brightness(Option<u8>),Wifi(String,bool),Bluetooth(crate::bluetooth::Snapshot),Error(String)}
 enum AudioCommand {Volume(u8),Mute(bool)}
 enum DeviceCommand {Brightness(u8)}
-pub struct Controller {audio:Sender<AudioCommand>,devices:Sender<DeviceCommand>,network:Sender<()>}
+pub struct Controller {audio:Sender<AudioCommand>,devices:Sender<DeviceCommand>,network:Sender<()>,bluetooth:Sender<()>}
 impl Controller {
     pub fn volume(&self,value:u8) {let _=self.audio.send(AudioCommand::Volume(value.min(100)));}
     pub fn mute(&self,value:bool) {let _=self.audio.send(AudioCommand::Mute(value));}
     pub fn brightness(&self,value:u8) {let _=self.devices.send(DeviceCommand::Brightness(value.min(100)));}
-    pub fn refresh(&self) {let _=self.network.send(());}
+    pub fn refresh(&self) {let _=self.network.send(());self.refresh_bluetooth();}
+    pub fn refresh_bluetooth(&self) {let _=self.bluetooth.send(());}
 }
 pub unsafe fn audio_endpoint()->windows::core::Result<IAudioEndpointVolume> {
     let enumerator:IMMDeviceEnumerator=CoCreateInstance(&MMDeviceEnumerator,None,CLSCTX_ALL)?;
@@ -85,27 +86,10 @@ fn wifi()->(String,bool) {
         }Ok(("Not connected".into(),false))
     };read().unwrap_or_else(|_|("Wi-Fi unavailable".into(),false))
 }
-fn bluetooth()->(String,Vec<String>) {
-    let read=||->windows::core::Result<(String,Vec<String>)> {
-        let adapter=BluetoothAdapter::GetDefaultAsync()?.get()?;
-        if adapter.GetRadioAsync().and_then(|op|op.get()).and_then(|r|r.State()).ok()==Some(RadioState::Off) {return Ok(("Bluetooth off".into(),Vec::new()));}
-        let mut names=Vec::new();let mut seen=std::collections::HashSet::new();
-        for (index,selector) in [BluetoothDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?,
-            BluetoothLEDevice::GetDeviceSelectorFromConnectionStatus(BluetoothConnectionStatus::Connected)?].into_iter().enumerate() {
-            for device in DeviceInformation::FindAllAsyncAqsFilter(&selector)?.get()? {
-                let id=device.Id()?;let name=device.Name()?.to_string();
-                let address=if index==0 {BluetoothDevice::FromIdAsync(&id).and_then(|op|op.get()).and_then(|d|d.BluetoothAddress())}
-                    else {BluetoothLEDevice::FromIdAsync(&id).and_then(|op|op.get()).and_then(|d|d.BluetoothAddress())};
-                let key=address.map(|v|format!("{v:012x}")).unwrap_or_else(|_|id.to_string());
-                if !name.is_empty() && seen.insert(key) {names.push(name);}
-            }
-        }
-        names.sort();Ok((if names.is_empty() {"None connected".into()}else{format!("{} connected",names.len())},names))
-    };read().unwrap_or_else(|_|("Bluetooth unavailable".into(),Vec::new()))
-}
 
 pub fn start()->(Controller,Receiver<Update>) {
     let (audio_tx,audio_rx)=mpsc::channel();let (devices_tx,devices_rx)=mpsc::channel();let (network_tx,network_rx)=mpsc::channel();let (updates,rx)=mpsc::channel();
+    let bluetooth_tx=crate::bluetooth::start(updates.clone());
     let audio_out=updates.clone();
     std::thread::spawn(move || {unsafe {crate::initialize_runtime();}
         let mut endpoint=unsafe {audio_endpoint().ok()};let mut refresh=Instant::now();let mut last=None;let mut first=true;
@@ -140,17 +124,17 @@ pub fn start()->(Controller,Receiver<Update>) {
         loop {
             if first {first=false;}else {match network_rx.recv_timeout(Duration::from_secs(8)) {Ok(())|Err(mpsc::RecvTimeoutError::Timeout)=>{},Err(_)=>return}}
             while network_rx.try_recv().is_ok() {}
-            let (wifi,wifi_connected)=wifi();let (bluetooth,connected)=bluetooth();let state=Devices{brightness:None,wifi,wifi_connected,bluetooth,connected};
-            if last.as_ref()!=Some(&state) {last=Some(state.clone());if updates.send(Update::Devices(state)).is_err() {return;}}
+            let state=wifi();
+            if last.as_ref()!=Some(&state) {last=Some(state.clone());if updates.send(Update::Wifi(state.0,state.1)).is_err() {return;}}
         }
     });
-    (Controller{audio:audio_tx,devices:devices_tx,network:network_tx},rx)
+    (Controller{audio:audio_tx,devices:devices_tx,network:network_tx,bluetooth:bluetooth_tx},rx)
 }
 
 #[cfg(test)] mod tests {
     #[test] #[ignore="reads live Windows audio, display and connectivity"] fn live_system_status() {
         unsafe {crate::initialize_runtime();println!("Audio: {:?}",super::audio_endpoint().and_then(|a|super::audio_read(&a)));println!("Brightness: {:?}",super::Brightness::open().and_then(|b|b.read()));}
-        println!("Wi-Fi: {:?}; Bluetooth: {:?}",super::wifi(),super::bluetooth());
+        println!("Wi-Fi: {:?}; Bluetooth: {:?}",super::wifi(),crate::bluetooth::read());
     }
     #[test] #[ignore="briefly adjusts and restores live system volume and brightness"] fn live_control_round_trip() {
         use super::*;

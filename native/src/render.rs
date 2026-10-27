@@ -66,7 +66,7 @@ impl Raster {
         SetStretchBltMode(dc,COLORONCOLOR);
         StretchDIBits(dc,x,y,self.width as i32,self.height as i32,0,0,self.width as i32,self.height as i32,self.pixels.as_ptr().cast(),&info,DIB_RGB_COLORS,SRCCOPY);
     }
-    pub unsafe fn upload_layered(&self,hwnd:windows_sys::Win32::Foundation::HWND,surface:&mut Surface)->bool {
+    pub unsafe fn upload_layered(&self,hwnd:windows_sys::Win32::Foundation::HWND,surface:&mut Surface,position:Option<(i32,i32)>)->bool {
         use windows_sys::Win32::{Foundation::{POINT,SIZE},UI::WindowsAndMessaging::*};
         let screen=GetDC(std::ptr::null_mut());
         let mut success=false;
@@ -74,7 +74,8 @@ impl Raster {
             // Copy premultiplied pixels directly; GDI raster operations can erase alpha.
             for y in 0..self.height {std::ptr::copy_nonoverlapping(self.pixels.as_ptr().add(y*self.width*4),surface.pixels.add(y*surface.width as usize*4),self.width*4);}
             let size=SIZE{cx:self.width as i32,cy:self.height as i32};let origin=POINT{x:0,y:0};
-            success=UpdateLayeredWindow(hwnd,screen,std::ptr::null(),&size,surface.dc,&origin,0,&BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8,BlendFlags:0,SourceConstantAlpha:255,AlphaFormat:AC_SRC_ALPHA as u8},ULW_ALPHA)!=0;
+            let destination=POINT{x:position.map(|p|p.0).unwrap_or(0),y:position.map(|p|p.1).unwrap_or(0)};
+            success=UpdateLayeredWindow(hwnd,screen,if position.is_some() {&destination}else{std::ptr::null()},&size,surface.dc,&origin,0,&BLENDFUNCTION{BlendOp:AC_SRC_OVER as u8,BlendFlags:0,SourceConstantAlpha:255,AlphaFormat:AC_SRC_ALPHA as u8},ULW_ALPHA)!=0;
         }ReleaseDC(std::ptr::null_mut(),screen);success
     }
     pub fn rounded_rect(&mut self,width:usize,height:usize,radius:f64,fill:u32,border:u32,background:u32) {
@@ -164,6 +165,23 @@ impl CoverCache {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] #[ignore="creates a hidden layered window to verify atomic geometry/pixel publishing"]
+    fn layered_frame_publishes_geometry_with_pixels() {
+        use windows_sys::Win32::{Foundation::RECT,UI::WindowsAndMessaging::*};
+        unsafe {
+            use windows_sys::Win32::UI::HiDpi::*;
+            let previous=SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            struct Dpi(DPI_AWARENESS_CONTEXT);impl Drop for Dpi {fn drop(&mut self) {unsafe {SetThreadDpiAwarenessContext(self.0);}}}let _dpi=Dpi(previous);
+            let window=CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW,crate::wide("STATIC").as_ptr(),crate::wide("Lieve atomic frame test").as_ptr(),WS_POPUP,17,23,10,10,null_mut(),null_mut(),null_mut(),std::ptr::null());
+            assert!(!window.is_null());struct Window(windows_sys::Win32::Foundation::HWND);impl Drop for Window {fn drop(&mut self) {unsafe {DestroyWindow(self.0);}}}let _window=Window(window);
+            let mut image=Raster::new();let mut surface=Surface::new();
+            for (w,h,x,y) in [(64,32,123,45),(53,27,130,55)] {
+                image.resize(w,h);for pixel in image.pixels.chunks_exact_mut(4) {pixel.copy_from_slice(&[8,8,11,255]);}
+                assert!(image.upload_layered(window,&mut surface,Some((x,y))));let mut r=std::mem::zeroed::<RECT>();GetWindowRect(window,&mut r);
+                assert_eq!((r.left,r.top,r.right-r.left,r.bottom-r.top),(x,y,w as i32,h as i32));assert_eq!(IsWindowVisible(window),0);
+            }
+        }
+    }
     use windows_sys::Win32::System::Threading::{GetCurrentProcess,GetGuiResources,GR_GDIOBJECTS};
     #[test] fn coverage_resolve_and_thumbnail_filter_average_instead_of_dithering() {
         let source=[0,0,0,255,255,255,255,255,255,255,255,255,0,0,0,255];let mut out=[0;4];

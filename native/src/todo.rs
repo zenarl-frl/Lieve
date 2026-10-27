@@ -112,22 +112,24 @@ impl App {
         InvalidateRect(hwnd,null(),0);
     }
     pub unsafe fn todo_view(&self,dc:HDC) {
-        let muted=rgb(135,135,151);
-        if self.tasks.is_empty() {self.text(dc,"A quieter place for your tasks",24,132,rgb(235,235,243),false);}
+        let muted=theme::MUTED;
+        if self.tasks.is_empty() {self.empty_state(dc,icons::Glyph::Check,"Your list is clear","Add a task to plan your next step.");}
         for (row,task) in self.tasks.iter().skip(self.task_offset).take(4).enumerate() {
             let y=layout::LIST_TOP+row as i32*layout::LIST_STEP;
-            self.tile(dc,layout::LIST_LEFT,y,layout::LIST_RIGHT-layout::LIST_LEFT,layout::LIST_ROW_H,12,rgb(23,23,30));
-            self.tile(dc,26,y+7,14,14,6,if task.done {self.color}else{rgb(64,64,76)});
-            SaveDC(dc);
-            IntersectClipRect(dc,self.px(48),self.px(y),self.px(layout::EDIT_LEFT-4),self.px(y+layout::LIST_ROW_H));
-            self.text(dc,&visual::shorten(&task.text,31),48,y+6,if task.done {muted}else{rgb(235,235,243)},true);
-            RestoreDC(dc,-1);
-            self.text(dc,"edit",322,y+6,muted,true);
-            self.text(dc,"x",370,y+6,muted,true);
+            let bg=self.list_row_style(dc,row,y);let check=if task.done {theme::control_accent(self.color)}else{rgb(46,46,61)};
+            self.smooth_tile(dc,layout::Rect{x:26,y:y+7,w:14,h:14},6,check,bg);
+            if task.done {self.icon(dc,26,y+7,14,icons::Glyph::Check,theme::TEXT,check,None);}
+            self.fitted_text(dc,&task.text,layout::Rect{x:48,y,w:layout::EDIT_LEFT-52,h:layout::LIST_ROW_H},self.small_font,if task.done {muted}else{theme::TEXT},DT_LEFT);
+            if task.done {
+                let text=wide(&task.text);let mut size=std::mem::zeroed::<SIZE>();GetTextExtentPoint32W(dc,text.as_ptr(),text.len() as i32-1,&mut size);
+                let pen=CreatePen(PS_SOLID,self.px(1).max(1),muted);let old=SelectObject(dc,pen);
+                MoveToEx(dc,self.px(48),self.px(y+14),std::ptr::null_mut());LineTo(dc,self.px(48)+size.cx.min(self.px(layout::EDIT_LEFT-52)),self.px(y+14));SelectObject(dc,old);DeleteObject(pen);
+            }
+            self.list_icon(dc,row,y,true,bg);self.list_icon(dc,row,y,false,bg);
         }
-        self.tile(dc,layout::LIST_LEFT,layout::ADD_TOP,layout::LIST_RIGHT-layout::LIST_LEFT,layout::ADD_H,12,rgb(38,27,34));
-        self.fitted_text(dc,"+ Add task",layout::Rect{x:28,y:layout::ADD_TOP,w:240,h:layout::ADD_H},self.small_font,self.color,DT_LEFT);
-        self.fitted_text(dc,&format!("{} / {} done",self.tasks.iter().filter(|t|t.done).count(),self.tasks.len()),layout::Rect{x:272,y:layout::ADD_TOP,w:100,h:layout::ADD_H},self.small_font,muted,DT_RIGHT);
+        let done=self.tasks.iter().filter(|t|t.done).count();
+        let count=if self.tasks.len()>4 {format!("{}–{} / {} · {done} done",self.task_offset+1,(self.task_offset+4).min(self.tasks.len()),self.tasks.len())}else{format!("{done} / {} done",self.tasks.len())};
+        self.list_add_button(dc,if self.tasks.len()<100 {"+ Add task"}else{"Task limit reached"},&count,layout::Action::TodoAdd,self.tasks.len()<100);
     }
 }
 

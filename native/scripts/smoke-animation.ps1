@@ -77,11 +77,16 @@ try {
     Toggle-Pin
     $pinnedByTest = $false
     Start-Sleep -Milliseconds 90
+    $reversalWatch = [Diagnostics.Stopwatch]::StartNew()
     $before = Get-Bounds
     Toggle-Pin
     $pinnedByTest = $true
     $after = Get-Bounds
-    if ($motion -ne 0 -and [math]::Abs(($after.B-$after.T)-($before.B-$before.T)) -gt 8*$scale) { throw 'Reversal jumped instead of continuing from the current frame.' }
+    "Reversal sample: $([math]::Round(($before.B-$before.T)/$scale,2)) -> $([math]::Round(($after.B-$after.T)/$scale,2)) logical px in $([math]::Round($reversalWatch.Elapsed.TotalMilliseconds,2)) ms"
+    # These are separate cross-process calls, not an atomic frame snapshot.
+    # Allow normal spring travel during IPC plus one display frame (60 Hz floor).
+    $travelAllowance=(8+1800*($reversalWatch.Elapsed.TotalSeconds+1.0/60.0))*$scale
+    if ($motion -ne 0 -and [math]::Abs(($after.B-$after.T)-($before.B-$before.T)) -gt $travelAllowance) { throw 'Reversal jumped instead of continuing from the current frame.' }
     Start-Sleep -Milliseconds 800
     $r = Get-Bounds
     if ([math]::Abs(($r.B-$r.T)/$scale-220) -gt 1) { throw 'Reversal did not settle open.' }

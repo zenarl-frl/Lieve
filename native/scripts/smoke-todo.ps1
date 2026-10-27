@@ -65,7 +65,7 @@ try {
     $rect = Get-Bounds
     # Coordinates must use physical window geometry, not a DPI-virtualized caller's units.
     $script:scale = ($rect.R - $rect.L) / 400.0
-    Click-Point 268 24
+    Click-Point 232 24
     $dialog = Open-TaskDialog
     $edit = [LieveTodoSmokeTest]::FindEdit($dialog)
     if ($edit -eq [IntPtr]::Zero) { throw 'Task input control not found.' }
