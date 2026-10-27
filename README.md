@@ -1,5 +1,5 @@
 # Lieve
-
+a
 Dynamic Island untuk Windows, dengan mata terinspirasi Liebe yang bisa dikustomisasi. Dibangun dengan **Rust native + Win32/GDI**, tanpa Electron, Tauri, atau WebView.
 
 > **Status: alpha dalam pengembangan.** Belum semua fitur selesai. Paket portable dan installer per-user dapat dibuat lokal; belum ada rilis publik bertag. Target RAM sekitar 30 MiB, bukan jaminan batas maksimum.
